@@ -1,8 +1,8 @@
 # 🔫 Revolver System
 
-> **Self-Healing, Multi-Trigger, Judge Revolver Engine for Large Language Models.**
+> **Self-Healing, Staggered-Hedged, Judge Revolver Engine for Large Language Models.**
 
-`revolver_system` is a high-availability, fault-tolerant Python AI orchestration library. It brings the power of **concurrent model racing**, **adaptive health scoring**, **circuit-breaker auto-cooldowns**, and **automated draft repair (The Judge)** to any Python application, bot, or web service.
+`revolver_system` is a high-availability, fault-tolerant Python AI orchestration library. It brings **adaptive staggered hedged racing**, **dynamic health scoring**, **circuit-breaker auto-cooldowns**, and **automated draft repair (The Judge)** to any Python application, bot, or web service.
 
 ---
 
@@ -10,8 +10,8 @@
 
 - **Zero Hardcoded Keys:** Bring your own API keys. Supports any OpenAI-compatible provider (Groq, Gemini, OpenRouter, OpenAI, Mistral, Cerebras, vLLM, Ollama, etc.).
 - **Dynamic Chamber Generation:** Register providers with your preferred models, or auto-discover available models via the provider's `/models` endpoint.
-- **Dual-Trigger Concurrent Racing:** Races top-2 healthiest chambers simultaneously on a thread pool. The first valid non-empty answer wins; slower competitors are instantly cancelled.
-- **Adaptive Health & Auto-Cooldowns:** Each chamber maintains a live health score (0–100). Fast responses gain health boosts; HTTP 429, 5xx, timeouts, or deprecated model IDs (400/404) trigger penalties and cooldowns.
+- **Staggered Hedged Racing (Phase 1):** Fires the healthiest chamber first and waits an adaptive delay ($\Delta t$, computed from that chamber's EWMA latency) before launching a backup racer. Eliminates P99 tail-latency spikes while saving redundant API quota when the primary responds fast. Fast failures trigger the backup *immediately*. Also supports classic dual-fire via `race_mode="concurrent"`.
+- **Adaptive Health & Auto-Cooldowns:** Each chamber maintains a live health score (0–100) and EWMA latency. Fast responses gain health boosts; HTTP 429, 5xx, timeouts, or deprecated model IDs (400/404) trigger penalties and cooldowns.
 - **The Judge Revolver:** Automatically detects broken drafts (markdown tables, prompt leakage, cutoff text) and prompts a healthy chamber to repair the draft before showing it to users.
 - **Default English Judge:** Clean, concise, general-purpose repair logic that users can customize with their own instructions.
 - **Connection Pooling:** Built on `requests.Session` with `HTTPAdapter` connection pooling for blazing-fast socket reuse.
@@ -25,10 +25,11 @@ Place `revolver_system` in your project or install it in your Python path:
 ```python
 from revolver import Revolver
 
-# 1. Initialize Revolver
+# 1. Initialize Revolver (defaults to adaptive staggered hedging)
 rev = Revolver(
     system_prompt="You are a helpful and intelligent AI assistant.",
     timeout=12,
+    race_mode="hedged",       # or "concurrent" for immediate dual-trigger
 )
 
 # 2. Add your providers & API keys (as many as you want!)
@@ -53,17 +54,30 @@ rev.add_chamber(
 # 3. Ask anything!
 response = rev.ask("Explain the theory of relativity simply.")
 print(response)
+
+# Per-call overrides (force concurrent race or custom hedge delay):
+urgent = rev.ask("Urgent query!", race_mode="concurrent")
+custom_wait = rev.ask("Heavy reasoning query", hedge_delay=1.5)
 ```
 
 ---
 
-## 🩺 Live Chamber Telemetry
+## 🩺 Live Chamber Telemetry & Quota Metrics
 
-Monitor your chamber fleet in real time:
+Monitor both your chamber fleet and Phase 1 quota savings in real time:
 
 ```python
 for chamber in rev.get_status():
-    print(f"• {chamber['name']}: {chamber['health']}% HP | Status: {chamber['status']}")
+    print(
+        f"• {chamber['name']}: {chamber['health']}% HP | "
+        f"Avg Latency: {chamber['avg_latency_ms']}ms | Status: {chamber['status']}"
+    )
+
+metrics = rev.get_metrics()
+print(
+    f"Quota saved: {metrics['calls_saved']} backup calls "
+    f"({metrics['hedge_efficiency_pct']}% efficiency)"
+)
 ```
 
 ---
@@ -80,6 +94,15 @@ custom_judge = (
 )
 
 rev = Revolver(judge_instruction=custom_judge)
+```
+
+---
+
+## 🧪 Running Tests & Demo
+
+```bash
+python3 demo.py
+python3 -m unittest test_revolver.py -v
 ```
 
 ---
