@@ -1,9 +1,10 @@
 """
-Revolver System — Self-Healing, Staggered-Hedged, Judge Revolver Engine.
+Revolver System — Self-Healing, Staggered-Hedged, Sync & Async Judge Revolver Engine.
 """
 
 from .revolver import (
     Revolver,
+    AsyncRevolver,
     add_chamber,
     add_provider,
     ask,
@@ -16,12 +17,15 @@ from .revolver import (
     DEFAULT_HEDGE_DELAY,
     MIN_HEDGE_DELAY,
     MAX_HEDGE_DELAY,
+    DEFAULT_ASYNC_MAX_KEEPALIVE,
+    DEFAULT_ASYNC_MAX_CONNECTIONS,
     KNOWN_PROVIDERS,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     "Revolver",
+    "AsyncRevolver",
     "add_chamber",
     "add_provider",
     "ask",
@@ -34,5 +38,7 @@ __all__ = [
     "DEFAULT_HEDGE_DELAY",
     "MIN_HEDGE_DELAY",
     "MAX_HEDGE_DELAY",
+    "DEFAULT_ASYNC_MAX_KEEPALIVE",
+    "DEFAULT_ASYNC_MAX_CONNECTIONS",
     "KNOWN_PROVIDERS",
 ]

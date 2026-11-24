@@ -1,22 +1,37 @@
 """
-Interactive Demo & Test Script for Revolver System (Phase 1: Staggered Hedged Racing).
+Interactive Demo & Test Script for Revolver System (Phase 1 & Phase 2).
 """
 
+import asyncio
 import os
 import sys
 
 # Add parent directory to path so imports work cleanly
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from revolver import Revolver
+from revolver import AsyncRevolver, Revolver
+
+
+async def async_demo_check():
+    async with AsyncRevolver(
+        system_prompt="You are a brilliant AI assistant.",
+        timeout=10,
+        race_mode="hedged",
+    ) as arev:
+        arev.add_provider(
+            provider="groq",
+            api_key="mock_groq_key",
+            models=["llama-3.3-70b-versatile"],
+        )
+        print(f"⚡ AsyncRevolver ready (chambers={len(arev.get_status())}, mode='{arev.race_mode}').")
 
 
 def main():
     print("=" * 60)
-    print("🔫 REVOLVER SYSTEM — STAGGERED HEDGED AI ENGINE (v1.1)")
+    print("🔫 REVOLVER SYSTEM — SYNC & ASYNC AI ENGINE (v1.2)")
     print("=" * 60)
 
-    # 1. Initialize Revolver Engine (Phase 1 defaults to adaptive staggered hedging)
+    # 1. Initialize Sync Revolver Engine (Phase 1 defaults to adaptive staggered hedging)
     rev = Revolver(
         system_prompt="You are a brilliant AI assistant. Answer clearly and concisely.",
         timeout=10,
@@ -78,7 +93,10 @@ def main():
     print("\n📈 Engine Telemetry Snapshot:")
     print(" ", rev.get_metrics())
 
-    print("\n🎉 All Phase 1 engine mechanics verified successfully!")
+    # 8. Verify AsyncRevolver (Phase 2)
+    asyncio.run(async_demo_check())
+
+    print("\n🎉 All Phase 1 & Phase 2 engine mechanics verified successfully!")
     rev.close()
 
 
