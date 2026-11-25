@@ -25,10 +25,14 @@ Key Features:
 
 import asyncio
 import concurrent.futures
+import json
 import logging
+import os
+import queue
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime, timedelta
+from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Set, Tuple, Union
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -37,6 +41,13 @@ try:
     import httpx
 except ImportError:  # pragma: no cover - optional runtime dependency for AsyncRevolver
     httpx = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency for Phase 5 JSON schema validation
+    from pydantic import BaseModel
+    from pydantic import ValidationError as PydanticValidationError
+except ImportError:  # pragma: no cover
+    BaseModel = None  # type: ignore[assignment, misc]
+    PydanticValidationError = Exception  # type: ignore[assignment, misc]
 
 log = logging.getLogger("revolver")
 
@@ -95,8 +106,216 @@ DEFAULT_JUDGE_INSTRUCTION = (
     "Output ONLY the corrected message text, with no preamble or explanation."
 )
 
+# Phase 5: JSON Schema Judge default instruction
+DEFAULT_JSON_JUDGE_INSTRUCTION = (
+    "The previous reply failed JSON schema validation with this error: {error}. "
+    "Rewrite it as valid JSON that strictly conforms to the requested schema. "
+    "Output ONLY the JSON object, with no markdown fences, no preamble, no explanation."
+)
+
 NO_CHAMBERS_MESSAGE = "⚠️ No AI chambers registered. Please add providers via add_provider() or add_chamber()."
 BUSY_MESSAGE = "🔌 All AI chambers are currently busy or unavailable. Please try again in a few moments."
+
+
+# ---------------------------------------------------------------------------
+# Budget Guard — On-Device Paid API Spending Controls
+# ---------------------------------------------------------------------------
+
+class BudgetExceeded(Exception):
+    """Raised when paid API budget is exhausted. Carries user-facing options."""
+    def __init__(self, message: str, options: Optional[List[Dict[str, str]]] = None):
+        self.options = options or []
+        super().__init__(message)
+
+
+class BudgetGuard:
+    """
+    Local, on-device budget guard for paid API chambers.
+
+    Stores config in a JSON file next to the app. Never phones home.
+    Supports monthly/yearly/custom cycles, warning thresholds, and
+    ignore-once / ignore-forever overrides.
+    """
+
+    def __init__(self, config_path: str = "revolver_budget.json", auto_load: bool = True):
+        self.config_path = config_path
+        self.config: Dict[str, Any] = {
+            "cycle_type": None,           # "monthly", "yearly", "custom"
+            "custom_days": 30,
+            "cycle_start": None,
+            "limit_usd": None,
+            "warning_threshold_pct": 80.0,
+            "spent_usd": 0.0,
+            "chambers": {},               # name -> {"paid": bool, "rate_prompt": float, "rate_completion": float}
+            "ignore_forever": False,
+            "ignore_until": None,
+        }
+        if auto_load:
+            self._load()
+
+    # -- persistence --------------------------------------------------------
+
+    def _load(self) -> None:
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    self.config.update(loaded)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    def _save(self) -> None:
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=2)
+        except OSError:
+            pass
+
+    # -- cycle logic --------------------------------------------------------
+
+    def _cycle_expired(self) -> bool:
+        if not self.config["cycle_start"] or not self.config["cycle_type"] or self.config["limit_usd"] is None:
+            return True
+        start = datetime.fromisoformat(self.config["cycle_start"])
+        now = datetime.now()
+        if self.config["cycle_type"] == "monthly":
+            return (now - start).days >= 30
+        if self.config["cycle_type"] == "yearly":
+            return (now - start).days >= 365
+        if self.config["cycle_type"] == "custom":
+            return (now - start).days >= int(self.config.get("custom_days", 30))
+        return True
+
+    def _maybe_reset_cycle(self) -> None:
+        if self._cycle_expired():
+            self.config["spent_usd"] = 0.0
+            self.config["cycle_start"] = datetime.now().isoformat()
+            self.config["ignore_until"] = None
+            self._save()
+
+    # -- configuration ------------------------------------------------------
+
+    def set_budget(
+        self,
+        limit_usd: float,
+        cycle_type: str = "monthly",
+        custom_days: int = 30,
+        warning_threshold_pct: float = 80.0,
+    ) -> None:
+        """Set a spending cap. Cycle starts now."""
+        self.config["cycle_type"] = cycle_type
+        self.config["custom_days"] = custom_days
+        self.config["cycle_start"] = datetime.now().isoformat()
+        self.config["limit_usd"] = float(limit_usd)
+        self.config["warning_threshold_pct"] = float(warning_threshold_pct)
+        self.config["spent_usd"] = 0.0
+        self.config["ignore_forever"] = False
+        self.config["ignore_until"] = None
+        self._save()
+
+    def mark_paid(self, chamber_name: str, rate_prompt: float, rate_completion: float) -> None:
+        """Tag a chamber as paid with per-1k-token rates (USD)."""
+        self.config["chambers"][chamber_name] = {
+            "paid": True,
+            "rate_prompt": float(rate_prompt),
+            "rate_completion": float(rate_completion),
+        }
+        self._save()
+
+    def mark_free(self, chamber_name: str) -> None:
+        """Tag a chamber as free (no budget deduction)."""
+        self.config["chambers"][chamber_name] = {
+            "paid": False,
+            "rate_prompt": 0.0,
+            "rate_completion": 0.0,
+        }
+        self._save()
+
+    def is_paid(self, chamber_name: str) -> bool:
+        chamber = self.config["chambers"].get(chamber_name)
+        return bool(chamber.get("paid", False)) if chamber else False
+
+    # -- enforcement --------------------------------------------------------
+
+    def check(self, estimated_cost_usd: float = 0.0) -> None:
+        """
+        Raise BudgetExceeded if the hard limit is hit (and not ignored).
+        Returns None if spending is allowed.
+        """
+        self._maybe_reset_cycle()
+
+        if self.config["limit_usd"] is None:
+            return  # No budget configured
+
+        if self.config.get("ignore_forever"):
+            return
+
+        ignore_until = self.config.get("ignore_until")
+        if ignore_until and datetime.now() < datetime.fromisoformat(ignore_until):
+            self.config["ignore_until"] = None  # consume ignore-once after one pass
+            self._save()
+            return
+
+        projected = self.config["spent_usd"] + estimated_cost_usd
+        limit = self.config["limit_usd"]
+
+        if projected >= limit:
+            options = [
+                {"label": "Raise budget", "action": "raise_budget"},
+                {"label": "Ignore once", "action": "ignore_once"},
+                {"label": "Ignore forever", "action": "ignore_forever"},
+                {"label": "Auto-switch to free only", "action": "switch_free"},
+            ]
+            raise BudgetExceeded(
+                f"Budget exhausted: ${self.config['spent_usd']:.4f} / ${limit:.4f} used",
+                options=options,
+            )
+
+    def record_spend(self, amount_usd: float) -> None:
+        self.config["spent_usd"] += float(amount_usd)
+        self._save()
+
+    def ignore_once(self) -> None:
+        self.config["ignore_until"] = (datetime.now() + timedelta(hours=1)).isoformat()
+        self.config["ignore_forever"] = False
+        self._save()
+
+    def ignore_forever(self) -> None:
+        self.config["ignore_forever"] = True
+        self.config["ignore_until"] = None
+        self._save()
+
+    def get_status(self) -> Dict[str, Any]:
+        self._maybe_reset_cycle()
+        limit = self.config["limit_usd"]
+        spent = self.config["spent_usd"]
+        return {
+            "cycle_type": self.config["cycle_type"],
+            "limit_usd": limit,
+            "spent_usd": round(spent, 4),
+            "remaining_usd": round(max(0.0, limit - spent), 4) if limit is not None else None,
+            "warning_threshold_pct": self.config["warning_threshold_pct"],
+            "ignore_forever": self.config.get("ignore_forever", False),
+            "chambers": self.config["chambers"],
+        }
+
+# ---------------------------------------------------------------------------
+# Phase 4: Complexity-Aware Model Tiering
+# ---------------------------------------------------------------------------
+TIER_SPRINT = "sprint"   # fast, cheap micro/flash models
+TIER_HEAVY = "heavy"     # frontier / reasoning models
+TIER_ANY = None          # chamber eligible for any tier
+
+# Prompt complexity heuristic thresholds & markers
+COMPLEXITY_LENGTH_THRESHOLD = 260          # chars above this lean toward "heavy"
+COMPLEXITY_CODE_BLOCK_MARKERS = ("```", "~`~`~")
+COMPLEXITY_REASONING_MARKERS = (
+    "prove", "derive", "solve", "step by step", "step-by-step", "reasoning",
+    "algorithm", "complex", "mathematical", "calculus", "theorem", "proof",
+    "debug", "refactor", "architecture", "design pattern", "multi-step",
+    "compare and contrast", "analyze", "explain in detail",
+)
 
 # Provider Endpoint Catalog
 KNOWN_PROVIDERS = {
@@ -178,6 +397,8 @@ class _BaseRevolver:
         min_hedge_delay: float = MIN_HEDGE_DELAY,
         max_hedge_delay: float = MAX_HEDGE_DELAY,
         hedge_multiplier: float = HEDGE_LATENCY_MULTIPLIER,
+        cost_rates: Optional[Dict[str, Tuple[float, float]]] = None,
+        budget_guard: Optional["BudgetGuard"] = None,
     ):
         mode = self._validate_race_mode(race_mode)
         self.system_prompt = system_prompt
@@ -192,11 +413,17 @@ class _BaseRevolver:
         self.max_hedge_delay = max(self.min_hedge_delay, float(max_hedge_delay))
         self.hedge_multiplier = max(0.1, float(hedge_multiplier))
 
+        # Phase 5: cost accounting. cost_rates[model] = (prompt_usd_per_1k, completion_usd_per_1k)
+        self.cost_rates: Dict[str, Tuple[float, float]] = cost_rates or {}
+
+        # Budget guard (on-device paid API spending controls)
+        self._budget_guard = budget_guard
+
         # Thread safety & state storage (in-memory only; never held across I/O)
         self._health_lock = threading.Lock()
         self._chamber_state: Dict[str, Dict[str, Any]] = {}
         self._chambers: List[Dict[str, Any]] = []
-        self._metrics: Dict[str, int] = {
+        self._metrics: Dict[str, Any] = {
             "total_requests": 0,
             "single_chamber_calls": 0,
             "hedged_saved_calls": 0,
@@ -204,8 +431,11 @@ class _BaseRevolver:
             "concurrent_races": 0,
             "judge_repairs": 0,
             "judge_failures": 0,
+            "schema_repairs": 0,
+            "schema_failures": 0,
             "total_prompt_tokens": 0,
             "total_completion_tokens": 0,
+            "total_cost_usd": 0.0,
         }
 
     @staticmethod
@@ -226,6 +456,7 @@ class _BaseRevolver:
         api_key: str,
         model: str,
         extra_headers: Optional[Dict[str, str]] = None,
+        tier: Optional[str] = None,
     ) -> None:
         """Register a single AI chamber and initialize its health state."""
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -238,6 +469,7 @@ class _BaseRevolver:
             "key": api_key,
             "model": model,
             "headers": headers,
+            "tier": tier,
         }
 
         with self._health_lock:
@@ -305,6 +537,7 @@ class _BaseRevolver:
         headers: Dict[str, str],
         models: List[str],
         provider_label: str,
+        tier: Optional[str] = None,
     ) -> List[str]:
         """Register one chamber per resolved model name and return their chamber names."""
         if not models:
@@ -319,6 +552,7 @@ class _BaseRevolver:
                 api_key=api_key,
                 model=model,
                 extra_headers=headers,
+                tier=tier,
             )
             created_chambers.append(chamber_name)
         return created_chambers
@@ -343,6 +577,7 @@ class _BaseRevolver:
                 "latency_samples": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
+                "cost_usd": 0.0,
             }
             self._chamber_state[name] = state
         return state
@@ -387,6 +622,15 @@ class _BaseRevolver:
                     state["completion_tokens"] += c_tok
                     self._metrics["total_prompt_tokens"] += p_tok
                     self._metrics["total_completion_tokens"] += c_tok
+
+                    # Phase 5: cost accounting per chamber model.
+                    rate = self.cost_rates.get(chamber["model"])
+                    if rate:
+                        prompt_rate, completion_rate = rate
+                        call_cost = (p_tok / 1000.0) * prompt_rate + (c_tok / 1000.0) * completion_rate
+                        state["cost_usd"] += call_cost
+                        self._metrics["total_cost_usd"] += call_cost
+                        self._budget_record_spend(chamber, call_cost)
             else:
                 penalty, cooldown = DEFAULT_OUTCOME_PENALTY.get(kind, (10.0, 8.0))
                 state["health"] = max(0.0, state["health"] - penalty)
@@ -439,6 +683,49 @@ class _BaseRevolver:
         healthy.sort(key=lambda item: (-item[0], item[1]))
         cooled.sort(key=lambda item: (-item[0], item[1]))
         return [item[2] for item in healthy], [item[2] for item in cooled]
+
+    @staticmethod
+    def classify_prompt(text: str) -> str:
+        """Heuristically classify a prompt as 'sprint' (simple) or 'heavy' (complex).
+
+        Used by Phase 4 tiered routing: simple prompts race within sprint-tier chambers,
+        complex prompts race within heavy-tier chambers.
+        """
+        if not text:
+            return TIER_SPRINT
+        lowered = text.lower()
+        length = len(text)
+
+        has_code = any(marker in text for marker in COMPLEXITY_CODE_BLOCK_MARKERS)
+        has_reasoning = any(marker in lowered for marker in COMPLEXITY_REASONING_MARKERS)
+
+        if has_code or has_reasoning or length > COMPLEXITY_LENGTH_THRESHOLD * 2:
+            return TIER_HEAVY
+        if length > COMPLEXITY_LENGTH_THRESHOLD or text.count("\n") > 6:
+            return TIER_HEAVY if has_reasoning else TIER_SPRINT
+        return TIER_SPRINT
+
+    def _select_racers(
+        self,
+        healthy: List[Dict[str, Any]],
+        cooled: List[Dict[str, Any]],
+        classification: str,
+    ) -> List[Dict[str, Any]]:
+        """Pick up to two racer chambers, honoring tier tags when tiering is enabled."""
+        tiered = [c for c in healthy + cooled if c.get("tier") is not None]
+        if not tiered:
+            return healthy[:2]
+
+        def tier_matches(chamber: Dict[str, Any]) -> bool:
+            tier = chamber.get("tier")
+            if tier is None or tier == TIER_ANY:
+                return True
+            return tier == classification
+
+        matched = [c for c in healthy + cooled if tier_matches(c)]
+        if matched:
+            return matched[:2]
+        return (healthy + cooled)[:2]
 
     # ------------------------------------------------------------------
     # Request Preparation & Response Evaluation (Shared Sync/Async)
@@ -599,6 +886,24 @@ class _BaseRevolver:
             return False, "abrupt cutoff"
         return True, ""
 
+    @staticmethod
+    def _parse_sse_delta(line: str) -> Optional[str]:
+        """Extract a content delta from an OpenAI-compatible SSE streaming line."""
+        if not line or not line.startswith("data:"):
+            return None
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            return None
+        try:
+            data = json.loads(payload)
+        except (ValueError, TypeError):
+            return None
+        try:
+            delta = (data.get("choices") or [{}])[0].get("delta") or {}
+            return delta.get("content") or ""
+        except (AttributeError, IndexError, TypeError):
+            return None
+
     def _try_sanitize_without_judge(self, draft: str) -> Tuple[Optional[str], str, str]:
         """Run Stages 1 & 2 validation/sanitization. Returns (valid_text_or_None, sanitized, reason)."""
         ok, reason = self.validate_draft(draft)
@@ -632,6 +937,76 @@ class _BaseRevolver:
         return None
 
     # ------------------------------------------------------------------
+    # Phase 5: Structured JSON Schema Judge
+    # ------------------------------------------------------------------
+
+    def _validate_schema(
+        self,
+        content: str,
+        response_format: Any,
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        """Parse content as JSON and validate against a Pydantic schema.
+
+        Returns (parsed_object, None) on success, or (None, error_string) on failure.
+        """
+        if BaseModel is None or not isinstance(response_format, type) or not issubclass(response_format, BaseModel):
+            return None, "schema validation unavailable (pydantic not installed or response_format is not a Pydantic model)"
+        if not content:
+            return None, "empty response"
+        try:
+            data = json.loads(content)
+        except (ValueError, TypeError) as exc:
+            return None, f"invalid JSON: {exc}"
+        try:
+            obj = response_format.model_validate(data)
+        except PydanticValidationError as exc:
+            return None, str(exc)
+        return obj, None
+
+    def _apply_schema_validation(
+        self,
+        ranked_chambers: List[Dict[str, Any]],
+        draft: str,
+        response_format: Any,
+        custom_judge_instruction: Optional[str] = None,
+    ) -> Optional[str]:
+        """Repair a draft until it conforms to the Pydantic schema, using The Judge.
+
+        Returns a valid JSON string conforming to the schema, or None if unrecoverable.
+        """
+        instruction_template = custom_judge_instruction or DEFAULT_JSON_JUDGE_INSTRUCTION
+        current = draft
+        for _ in range(max(1, self.judge_max_attempts)):
+            obj, error = self._validate_schema(current, response_format)
+            if obj is not None:
+                with self._health_lock:
+                    self._metrics["schema_repairs"] += 1
+                return current  # already valid JSON
+
+            for judge in ranked_chambers[: self.judge_max_attempts]:
+                log.info("Revolver Schema Judge invoked on %s (error: %s)", judge["name"], error)
+                repair_messages = [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": instruction_template.format(error=error)},
+                    {"role": "user", "content": f"Invalid draft to repair:\n{current}"},
+                ]
+                content, outcome = self._call_chamber(judge, repair_messages)
+                self._apply_outcome(judge, outcome)
+                if content:
+                    cleaned = self.sanitize_draft(content)
+                    candidate = cleaned or content
+                    obj2, _ = self._validate_schema(candidate, response_format)
+                    if obj2 is not None:
+                        with self._health_lock:
+                            self._metrics["schema_repairs"] += 1
+                        return candidate
+                    current = candidate
+
+        with self._health_lock:
+            self._metrics["schema_failures"] += 1
+        return None
+
+    # ------------------------------------------------------------------
     # Telemetry & Status
     # ------------------------------------------------------------------
 
@@ -659,6 +1034,7 @@ class _BaseRevolver:
                     "last_latency_ms": round(last_lat * 1000.0, 1) if last_lat is not None else None,
                     "prompt_tokens": state["prompt_tokens"],
                     "completion_tokens": state["completion_tokens"],
+                    "cost_usd": round(state["cost_usd"], 6),
                 })
         results.sort(key=lambda x: -x["health"])
         return results
@@ -677,6 +1053,125 @@ class _BaseRevolver:
         )
         m["calls_saved"] = m["hedged_saved_calls"]
         return m
+
+    def export_prometheus(self) -> str:
+        """Export chamber & engine telemetry in Prometheus/OpenTelemetry text format.
+
+        Metrics:
+          revolver_requests_total
+          revolver_requests_saved_total (hedged backup calls avoided)
+          revolver_chamber_health{chamber,model,tier}
+          revolver_chamber_cost_usd_total{chamber,model}
+          revolver_chamber_prompt_tokens_total{chamber,model}
+          revolver_chamber_completion_tokens_total{chamber,model}
+          revolver_chamber_successes_total{chamber,model}
+          revolver_chamber_failures_total{chamber,model}
+          revolver_engine_cost_usd_total
+          revolver_engine_prompt_tokens_total
+          revolver_engine_completion_tokens_total
+        """
+        now = time.time()
+        lines: List[str] = []
+        with self._health_lock:
+            m = self._metrics.copy()
+            chambers = list(self._chambers)
+            states = {c["name"]: self._get_state_locked(c["name"]) for c in chambers}
+
+        def esc(label: str) -> str:
+            return str(label).replace("\\", "\\\\").replace('"', '\\"') if label is not None else ""
+
+        lines.append('# HELP revolver_requests_total Total requests processed by the engine')
+        lines.append('# TYPE revolver_requests_total counter')
+        lines.append(f'revolver_requests_total {m["total_requests"]}')
+        lines.append('# HELP revolver_requests_saved_total Hedged backup API calls avoided')
+        lines.append('# TYPE revolver_requests_saved_total counter')
+        lines.append(f'revolver_requests_saved_total {m["hedged_saved_calls"]}')
+        lines.append('# HELP revolver_engine_cost_usd_total Estimated total spend in USD')
+        lines.append('# TYPE revolver_engine_cost_usd_total counter')
+        lines.append(f'revolver_engine_cost_usd_total {m.get("total_cost_usd", 0.0)}')
+        lines.append('# HELP revolver_engine_prompt_tokens_total Total prompt tokens')
+        lines.append('# TYPE revolver_engine_prompt_tokens_total counter')
+        lines.append(f'revolver_engine_prompt_tokens_total {m["total_prompt_tokens"]}')
+        lines.append('# HELP revolver_engine_completion_tokens_total Total completion tokens')
+        lines.append('# TYPE revolver_engine_completion_tokens_total counter')
+        lines.append(f'revolver_engine_completion_tokens_total {m["total_completion_tokens"]}')
+
+        for chamber in chambers:
+            name = esc(chamber["name"])
+            model = esc(chamber["model"])
+            tier = esc(chamber.get("tier") or "any")
+            state = states[chamber["name"]]
+            self._decay_locked(state, now)
+            lines.append('# HELP revolver_chamber_health Chamber health score (0-100)')
+            lines.append('# TYPE revolver_chamber_health gauge')
+            lines.append(f'revolver_chamber_health{{chamber="{name}",model="{model}",tier="{tier}"}} {state["health"]}')
+            lines.append('# HELP revolver_chamber_cost_usd_total Estimated chamber spend in USD')
+            lines.append('# TYPE revolver_chamber_cost_usd_total counter')
+            lines.append(f'revolver_chamber_cost_usd_total{{chamber="{name}",model="{model}"}} {state.get("cost_usd", 0.0)}')
+            lines.append('# HELP revolver_chamber_prompt_tokens_total Chamber prompt tokens')
+            lines.append('# TYPE revolver_chamber_prompt_tokens_total counter')
+            lines.append(f'revolver_chamber_prompt_tokens_total{{chamber="{name}",model="{model}"}} {state["prompt_tokens"]}')
+            lines.append('# HELP revolver_chamber_completion_tokens_total Chamber completion tokens')
+            lines.append('# TYPE revolver_chamber_completion_tokens_total counter')
+            lines.append(f'revolver_chamber_completion_tokens_total{{chamber="{name}",model="{model}"}} {state["completion_tokens"]}')
+            lines.append('# HELP revolver_chamber_successes_total Chamber successful requests')
+            lines.append('# TYPE revolver_chamber_successes_total counter')
+            lines.append(f'revolver_chamber_successes_total{{chamber="{name}",model="{model}"}} {state["successes"]}')
+            lines.append('# HELP revolver_chamber_failures_total Chamber failed requests')
+            lines.append('# TYPE revolver_chamber_failures_total counter')
+            lines.append(f'revolver_chamber_failures_total{{chamber="{name}",model="{model}"}} {state["failures"]}')
+
+        return "\n".join(lines) + "\n"
+
+    # ------------------------------------------------------------------
+    # Budget Guard API
+    # ------------------------------------------------------------------
+
+    def set_budget(
+        self,
+        limit_usd: float,
+        cycle_type: str = "monthly",
+        custom_days: int = 30,
+        warning_threshold_pct: float = 80.0,
+        config_path: Optional[str] = None,
+    ) -> None:
+        """Configure on-device spending cap for paid chambers."""
+        if self._budget_guard is None:
+            self._budget_guard = BudgetGuard(config_path=config_path or "revolver_budget.json")
+        self._budget_guard.set_budget(
+            limit_usd=limit_usd,
+            cycle_type=cycle_type,
+            custom_days=custom_days,
+            warning_threshold_pct=warning_threshold_pct,
+        )
+
+    def mark_chamber_paid(self, name: str, rate_prompt: float, rate_completion: float) -> None:
+        """Tag a chamber as paid with per-1k-token rates (USD)."""
+        if self._budget_guard is None:
+            self._budget_guard = BudgetGuard()
+        self._budget_guard.mark_paid(name, rate_prompt, rate_completion)
+
+    def mark_chamber_free(self, name: str) -> None:
+        """Tag a chamber as free (no budget deduction)."""
+        if self._budget_guard is None:
+            self._budget_guard = BudgetGuard()
+        self._budget_guard.mark_free(name)
+
+    def get_budget_status(self) -> Dict[str, Any]:
+        """Return current budget status (or empty dict if no guard configured)."""
+        if self._budget_guard is None:
+            return {"budget_configured": False}
+        return {"budget_configured": True, **self._budget_guard.get_status()}
+
+    def _budget_check(self, estimated_cost_usd: float = 0.0) -> None:
+        """Raise BudgetExceeded if paid spending is blocked."""
+        if self._budget_guard is not None:
+            self._budget_guard.check(estimated_cost_usd)
+
+    def _budget_record_spend(self, chamber: Dict[str, Any], amount_usd: float) -> None:
+        """Record spend if chamber is paid and guard is configured."""
+        if self._budget_guard is not None and self._budget_guard.is_paid(chamber["name"]):
+            self._budget_guard.record_spend(amount_usd)
 
 
 # ===========================================================================
@@ -702,6 +1197,8 @@ class Revolver(_BaseRevolver):
         min_hedge_delay: float = MIN_HEDGE_DELAY,
         max_hedge_delay: float = MAX_HEDGE_DELAY,
         hedge_multiplier: float = HEDGE_LATENCY_MULTIPLIER,
+        cost_rates: Optional[Dict[str, Tuple[float, float]]] = None,
+        budget_guard: Optional["BudgetGuard"] = None,
     ):
         super().__init__(
             system_prompt=system_prompt,
@@ -714,6 +1211,8 @@ class Revolver(_BaseRevolver):
             min_hedge_delay=min_hedge_delay,
             max_hedge_delay=max_hedge_delay,
             hedge_multiplier=hedge_multiplier,
+            cost_rates=cost_rates,
+            budget_guard=budget_guard,
         )
         self._session = requests.Session()
         adapter = HTTPAdapter(pool_connections=4, pool_maxsize=session_pool_size)
@@ -751,6 +1250,7 @@ class Revolver(_BaseRevolver):
         extra_headers: Optional[Dict[str, str]] = None,
         discover_models: bool = False,
         max_chambers: int = 5,
+        tier: Optional[str] = None,
     ) -> List[str]:
         """Register a provider synchronously, optionally auto-discovering live models."""
         p_name, target_url, m_url, headers, default_models = self._resolve_provider_config(
@@ -770,7 +1270,9 @@ class Revolver(_BaseRevolver):
         if not target_models:
             target_models = default_models
 
-        return self._register_provider_models(p_name, target_url, api_key, headers, target_models, provider)
+        return self._register_provider_models(
+            p_name, target_url, api_key, headers, target_models, provider, tier=tier
+        )
 
     def _call_chamber(
         self,
@@ -1004,14 +1506,25 @@ class Revolver(_BaseRevolver):
         ranked_chambers: List[Dict[str, Any]],
         draft: str,
         custom_judge_instruction: Optional[str] = None,
+        response_format: Any = None,
     ) -> Optional[str]:
-        """Validate winning draft; mechanically sanitize or escalate synchronously to the Judge."""
+        """Validate winning draft; mechanically sanitize or escalate synchronously to the Judge.
+
+        When ``response_format`` is a Pydantic model class, the draft is also validated
+        against the JSON schema and auto-repaired by The Schema Judge when invalid.
+        """
         clean_or_none, fallback_draft, reason = self._try_sanitize_without_judge(draft)
         if clean_or_none is not None:
-            return clean_or_none
+            candidate = clean_or_none
+        else:
+            repaired = self._judge_repair(ranked_chambers, fallback_draft, reason, custom_judge_instruction)
+            candidate = self._accept_repaired_draft(repaired)
+            if candidate is None:
+                return None
 
-        repaired = self._judge_repair(ranked_chambers, fallback_draft, reason, custom_judge_instruction)
-        return self._accept_repaired_draft(repaired)
+        if response_format is not None:
+            return self._apply_schema_validation(ranked_chambers, candidate, response_format, custom_judge_instruction)
+        return candidate
 
     def ask(
         self,
@@ -1021,8 +1534,25 @@ class Revolver(_BaseRevolver):
         judge_instruction: Optional[str] = None,
         race_mode: Optional[str] = None,
         hedge_delay: Optional[float] = None,
-    ) -> str:
-        """Process prompt synchronously through Staggered Hedging / Concurrent Race + Judge."""
+        stream: bool = False,
+        response_format: Any = None,
+    ) -> Union[str, Generator[str, None, None]]:
+        """Process prompt synchronously through Staggered Hedging / Concurrent Race + Judge.
+
+        When ``stream=True``, returns a generator yielding content chunks live (TTFT race)
+        instead of a single completed string. The Judge repair loop is skipped for streaming.
+        When ``response_format`` is a Pydantic model class, the reply is validated against
+        its JSON schema and auto-healed by The Schema Judge.
+        """
+        if stream:
+            return self._ask_streaming(
+                user_message,
+                extra_context=extra_context,
+                system_prompt=system_prompt,
+                judge_instruction=judge_instruction,
+                race_mode=race_mode,
+                hedge_delay=hedge_delay,
+            )
         if not self._chambers:
             return NO_CHAMBERS_MESSAGE
 
@@ -1035,8 +1565,22 @@ class Revolver(_BaseRevolver):
         healthy, cooled = self.rank_chambers(time.time())
         ranked = healthy + cooled
 
+        classification = self.classify_prompt(user_message)
         attempted_names: Set[str] = set()
-        racers = healthy[:2]
+        racers = self._select_racers(healthy, cooled, classification)
+
+        # Budget guard: if paid racers are blocked, fall back to free-only chambers.
+        if racers and self._budget_guard is not None:
+            paid_racers = [c for c in racers if self._budget_guard.is_paid(c["name"])]
+            if paid_racers:
+                try:
+                    self._budget_check()
+                except BudgetExceeded:
+                    log.warning("Budget exhausted; skipping paid chambers, falling back to free-only")
+                    racers = [c for c in racers if not self._budget_guard.is_paid(c["name"])]
+                    if not racers:
+                        return BUSY_MESSAGE + " (budget exhausted, no free chambers available)"
+
         if racers:
             if active_mode == "concurrent":
                 content, _, attempted_names = self._race_concurrent(racers, messages, deadline)
@@ -1045,7 +1589,7 @@ class Revolver(_BaseRevolver):
                     racers, messages, deadline, override_hedge_delay=hedge_delay
                 )
             if content:
-                final = self._finalize_draft(ranked, content, judge_instruction)
+                final = self._finalize_draft(ranked, content, judge_instruction, response_format=response_format)
                 if final:
                     return final
 
@@ -1060,11 +1604,122 @@ class Revolver(_BaseRevolver):
             self._apply_outcome(chamber, outcome)
             attempted_names.add(chamber["name"])
             if content:
-                final = self._finalize_draft(ranked, content, judge_instruction)
+                final = self._finalize_draft(ranked, content, judge_instruction, response_format=response_format)
                 if final:
                     return final
 
         return BUSY_MESSAGE
+
+    def _ask_streaming(
+        self,
+        user_message: str,
+        extra_context: str = "",
+        system_prompt: Optional[str] = None,
+        judge_instruction: Optional[str] = None,
+        race_mode: Optional[str] = None,
+        hedge_delay: Optional[float] = None,
+    ) -> Generator[str, None, None]:
+        """Stream a reply via TTFT race: first chamber to yield a chunk wins; losers are cut off."""
+        if not self._chambers:
+            yield NO_CHAMBERS_MESSAGE
+            return
+
+        active_mode = self._validate_race_mode(race_mode or self.race_mode)
+        del active_mode  # streaming always fires both racers concurrently for a true TTFT race
+        with self._health_lock:
+            self._metrics["total_requests"] += 1
+
+        messages = self._build_messages(user_message, extra_context, system_prompt)
+        deadline = time.monotonic() + self.timeout * 2
+        healthy, cooled = self.rank_chambers(time.time())
+        classification = self.classify_prompt(user_message)
+        racers = self._select_racers(healthy, cooled, classification)
+        racers_map = {c["name"]: c for c in racers}
+
+        result_q: "queue.Queue[Tuple[str, ...]]" = queue.Queue()
+        stop_events: Dict[str, threading.Event] = {}
+        threads: Dict[str, threading.Thread] = {}
+
+        def _run(chamber: Dict[str, Any]) -> None:
+            name = chamber["name"]
+            stop = stop_events[name]
+            headers, payload, req_timeout = self._prepare_request(chamber, messages)
+            headers["Accept"] = "text/event-stream"
+            payload["stream"] = True
+            resp = None
+            try:
+                resp = self._session.post(
+                    chamber["url"], headers=headers, json=payload, stream=True, timeout=req_timeout
+                )
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if stop.is_set():
+                        break
+                    if not raw_line:
+                        continue
+                    chunk = self._parse_sse_delta(raw_line)
+                    if chunk:
+                        result_q.put(("chunk", name, chunk))
+            except Exception as exc:  # noqa: BLE001 - stream failures are reported as chunks/errors
+                log.warning("Streaming chamber %s errored: %s", name, exc)
+                result_q.put(("error", name, str(exc)))
+            finally:
+                result_q.put(("done", name))
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        for chamber in racers:
+            stop_events[chamber["name"]] = threading.Event()
+            t = threading.Thread(target=_run, args=(chamber,), daemon=True)
+            threads[chamber["name"]] = t
+            t.start()
+
+        winner: Optional[str] = None
+        finished: Set[str] = set()
+        yielded_any = False
+        try:
+            while len(finished) < len(racers):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    log.warning("Streaming race reached deadline across %d chamber(s)", len(racers))
+                    break
+                try:
+                    item = result_q.get(timeout=min(0.2, remaining))
+                except queue.Empty:
+                    continue
+                kind = item[0]
+                if kind == "done":
+                    finished.add(item[1])
+                    continue
+                if kind == "error":
+                    finished.add(item[1])
+                    continue
+                if kind == "chunk":
+                    _, name, chunk = item
+                    if winner is None:
+                        winner = name
+                        yielded_any = True
+                        with self._health_lock:
+                            self._metrics["concurrent_races"] += 1
+                        for other_name, ev in stop_events.items():
+                            if other_name != name:
+                                ev.set()
+                    if winner == name:
+                        yield chunk
+                        yielded_any = True
+        finally:
+            for ev in stop_events.values():
+                ev.set()
+
+        # Best-effort health accounting for the streaming race.
+        if winner is not None and yielded_any:
+            self._apply_outcome(racers_map[winner], ("ok", 0.0))
+        elif racers:
+            for chamber in racers:
+                if chamber["name"] != winner:
+                    self._apply_outcome(chamber, ("network", None))
 
     def close(self) -> None:
         """Close thread pool executor and HTTP session."""
@@ -1101,6 +1756,8 @@ class AsyncRevolver(_BaseRevolver):
         min_hedge_delay: float = MIN_HEDGE_DELAY,
         max_hedge_delay: float = MAX_HEDGE_DELAY,
         hedge_multiplier: float = HEDGE_LATENCY_MULTIPLIER,
+        cost_rates: Optional[Dict[str, Tuple[float, float]]] = None,
+        budget_guard: Optional["BudgetGuard"] = None,
     ):
         if httpx is None:
             raise ImportError("AsyncRevolver requires 'httpx'. Install it with: pip install httpx")
@@ -1116,6 +1773,8 @@ class AsyncRevolver(_BaseRevolver):
             min_hedge_delay=min_hedge_delay,
             max_hedge_delay=max_hedge_delay,
             hedge_multiplier=hedge_multiplier,
+            cost_rates=cost_rates,
+            budget_guard=budget_guard,
         )
         self._async_limits = httpx.Limits(
             max_keepalive_connections=max_keepalive_connections,
@@ -1156,13 +1815,16 @@ class AsyncRevolver(_BaseRevolver):
         url: Optional[str] = None,
         models_url: Optional[str] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        tier: Optional[str] = None,
     ) -> List[str]:
         """Register a provider synchronously using `models` or known defaults."""
         p_name, target_url, _, headers, default_models = self._resolve_provider_config(
             provider, url, models_url, extra_headers
         )
         target_models = list(models) if models else default_models
-        return self._register_provider_models(p_name, target_url, api_key, headers, target_models, provider)
+        return self._register_provider_models(
+            p_name, target_url, api_key, headers, target_models, provider, tier=tier
+        )
 
     async def adiscover_models(self, models_url: str, api_key: str) -> List[str]:
         """Asynchronously query provider's /models endpoint and return normalized model IDs."""
@@ -1186,6 +1848,7 @@ class AsyncRevolver(_BaseRevolver):
         extra_headers: Optional[Dict[str, str]] = None,
         discover_models: bool = False,
         max_chambers: int = 5,
+        tier: Optional[str] = None,
     ) -> List[str]:
         """Asynchronously register a provider, optionally auto-discovering live models."""
         p_name, target_url, m_url, headers, default_models = self._resolve_provider_config(
@@ -1206,7 +1869,9 @@ class AsyncRevolver(_BaseRevolver):
         if not target_models:
             target_models = default_models
 
-        return self._register_provider_models(p_name, target_url, api_key, headers, target_models, provider)
+        return self._register_provider_models(
+            p_name, target_url, api_key, headers, target_models, provider, tier=tier
+        )
 
     async def _acall_chamber(
         self,
@@ -1424,14 +2089,65 @@ class AsyncRevolver(_BaseRevolver):
         ranked_chambers: List[Dict[str, Any]],
         draft: str,
         custom_judge_instruction: Optional[str] = None,
+        response_format: Any = None,
     ) -> Optional[str]:
-        """Validate winning draft; mechanically sanitize or escalate asynchronously to the Judge."""
+        """Validate winning draft; mechanically sanitize or escalate asynchronously to the Judge.
+
+        When ``response_format`` is a Pydantic model class, the draft is also validated
+        against the JSON schema and auto-repaired by The Schema Judge when invalid.
+        """
         clean_or_none, fallback_draft, reason = self._try_sanitize_without_judge(draft)
         if clean_or_none is not None:
-            return clean_or_none
+            candidate = clean_or_none
+        else:
+            repaired = await self._ajudge_repair(ranked_chambers, fallback_draft, reason, custom_judge_instruction)
+            candidate = self._accept_repaired_draft(repaired)
+            if candidate is None:
+                return None
 
-        repaired = await self._ajudge_repair(ranked_chambers, fallback_draft, reason, custom_judge_instruction)
-        return self._accept_repaired_draft(repaired)
+        if response_format is not None:
+            return await self._aapply_schema_validation(ranked_chambers, candidate, response_format, custom_judge_instruction)
+        return candidate
+
+    async def _aapply_schema_validation(
+        self,
+        ranked_chambers: List[Dict[str, Any]],
+        draft: str,
+        response_format: Any,
+        custom_judge_instruction: Optional[str] = None,
+    ) -> Optional[str]:
+        """Async variant of `_apply_schema_validation`: repair draft to conform to Pydantic schema."""
+        instruction_template = custom_judge_instruction or DEFAULT_JSON_JUDGE_INSTRUCTION
+        current = draft
+        for _ in range(max(1, self.judge_max_attempts)):
+            obj, error = self._validate_schema(current, response_format)
+            if obj is not None:
+                with self._health_lock:
+                    self._metrics["schema_repairs"] += 1
+                return current
+
+            for judge in ranked_chambers[: self.judge_max_attempts]:
+                log.info("Async Revolver Schema Judge invoked on %s (error: %s)", judge["name"], error)
+                repair_messages = [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": instruction_template.format(error=error)},
+                    {"role": "user", "content": f"Invalid draft to repair:\n{current}"},
+                ]
+                content, outcome = await self._acall_chamber(judge, repair_messages)
+                self._apply_outcome(judge, outcome)
+                if content:
+                    cleaned = self.sanitize_draft(content)
+                    candidate = cleaned or content
+                    obj2, _ = self._validate_schema(candidate, response_format)
+                    if obj2 is not None:
+                        with self._health_lock:
+                            self._metrics["schema_repairs"] += 1
+                        return candidate
+                    current = candidate
+
+        with self._health_lock:
+            self._metrics["schema_failures"] += 1
+        return None
 
     async def ask(
         self,
@@ -1441,8 +2157,25 @@ class AsyncRevolver(_BaseRevolver):
         judge_instruction: Optional[str] = None,
         race_mode: Optional[str] = None,
         hedge_delay: Optional[float] = None,
-    ) -> str:
-        """Process prompt asynchronously through Staggered Hedging / Concurrent Race + Judge."""
+        stream: bool = False,
+        response_format: Any = None,
+    ) -> Union[str, AsyncGenerator[str, None]]:
+        """Process prompt asynchronously through Staggered Hedging / Concurrent Race + Judge.
+
+        When ``stream=True``, returns an async generator yielding content chunks live (TTFT race)
+        instead of a single completed string. The Judge repair loop is skipped for streaming.
+        When ``response_format`` is a Pydantic model class, the reply is validated against
+        its JSON schema and auto-healed by The Schema Judge.
+        """
+        if stream:
+            return self._aask_streaming(
+                user_message,
+                extra_context=extra_context,
+                system_prompt=system_prompt,
+                judge_instruction=judge_instruction,
+                race_mode=race_mode,
+                hedge_delay=hedge_delay,
+            )
         if not self._chambers:
             return NO_CHAMBERS_MESSAGE
 
@@ -1455,8 +2188,22 @@ class AsyncRevolver(_BaseRevolver):
         healthy, cooled = self.rank_chambers(time.time())
         ranked = healthy + cooled
 
+        classification = self.classify_prompt(user_message)
         attempted_names: Set[str] = set()
-        racers = healthy[:2]
+        racers = self._select_racers(healthy, cooled, classification)
+
+        # Budget guard: if paid racers are blocked, fall back to free-only chambers.
+        if racers and self._budget_guard is not None:
+            paid_racers = [c for c in racers if self._budget_guard.is_paid(c["name"])]
+            if paid_racers:
+                try:
+                    self._budget_check()
+                except BudgetExceeded:
+                    log.warning("Async budget exhausted; skipping paid chambers, falling back to free-only")
+                    racers = [c for c in racers if not self._budget_guard.is_paid(c["name"])]
+                    if not racers:
+                        return BUSY_MESSAGE + " (budget exhausted, no free chambers available)"
+
         if racers:
             if active_mode == "concurrent":
                 content, _, attempted_names = await self._arace_concurrent(racers, messages, deadline)
@@ -1465,7 +2212,7 @@ class AsyncRevolver(_BaseRevolver):
                     racers, messages, deadline, override_hedge_delay=hedge_delay
                 )
             if content:
-                final = await self._afinalize_draft(ranked, content, judge_instruction)
+                final = await self._afinalize_draft(ranked, content, judge_instruction, response_format=response_format)
                 if final:
                     return final
 
@@ -1480,11 +2227,118 @@ class AsyncRevolver(_BaseRevolver):
             self._apply_outcome(chamber, outcome)
             attempted_names.add(chamber["name"])
             if content:
-                final = await self._afinalize_draft(ranked, content, judge_instruction)
+                final = await self._afinalize_draft(ranked, content, judge_instruction, response_format=response_format)
                 if final:
                     return final
 
         return BUSY_MESSAGE
+
+    async def _aask_streaming(
+        self,
+        user_message: str,
+        extra_context: str = "",
+        system_prompt: Optional[str] = None,
+        judge_instruction: Optional[str] = None,
+        race_mode: Optional[str] = None,
+        hedge_delay: Optional[float] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Async stream a reply via TTFT race: first chamber to yield a chunk wins; losers cancelled."""
+        if not self._chambers:
+            yield NO_CHAMBERS_MESSAGE
+            return
+
+        active_mode = self._validate_race_mode(race_mode or self.race_mode)
+        del active_mode  # streaming always fires both racers concurrently for a true TTFT race
+        with self._health_lock:
+            self._metrics["total_requests"] += 1
+
+        messages = self._build_messages(user_message, extra_context, system_prompt)
+        deadline = time.monotonic() + self.timeout * 2
+        healthy, cooled = self.rank_chambers(time.time())
+        classification = self.classify_prompt(user_message)
+        racers = self._select_racers(healthy, cooled, classification)
+        racers_map = {c["name"]: c for c in racers}
+
+        result_q: "asyncio.Queue[Tuple[str, ...]]" = asyncio.Queue()
+        stop_events: Dict[str, asyncio.Event] = {}
+        tasks: Dict[str, asyncio.Task] = {}
+
+        async def _run(chamber: Dict[str, Any]) -> None:
+            name = chamber["name"]
+            stop = stop_events[name]
+            headers, payload, req_timeout = self._prepare_request(chamber, messages)
+            headers["Accept"] = "text/event-stream"
+            payload["stream"] = True
+            client = self._get_client()
+            resp = None
+            try:
+                async with client.stream(
+                    "POST", chamber["url"], headers=headers, json=payload, timeout=req_timeout
+                ) as resp:
+                    async for raw_line in resp.aiter_lines():
+                        if stop.is_set():
+                            break
+                        if not raw_line:
+                            continue
+                        chunk = self._parse_sse_delta(raw_line)
+                        if chunk:
+                            await result_q.put(("chunk", name, chunk))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Async streaming chamber %s errored: %s", name, exc)
+                await result_q.put(("error", name, str(exc)))
+            finally:
+                await result_q.put(("done", name))
+
+        for chamber in racers:
+            stop_events[chamber["name"]] = asyncio.Event()
+            tasks[chamber["name"]] = asyncio.create_task(_run(chamber))
+
+        winner: Optional[str] = None
+        finished: Set[str] = set()
+        yielded_any = False
+        try:
+            while len(finished) < len(racers):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    log.warning("Async streaming race reached deadline across %d chamber(s)", len(racers))
+                    break
+                try:
+                    item = await asyncio.wait_for(result_q.get(), timeout=min(0.2, remaining))
+                except asyncio.TimeoutError:
+                    continue
+                kind = item[0]
+                if kind == "done":
+                    finished.add(item[1])
+                    continue
+                if kind == "error":
+                    finished.add(item[1])
+                    continue
+                if kind == "chunk":
+                    _, name, chunk = item
+                    if winner is None:
+                        winner = name
+                        yielded_any = True
+                        with self._health_lock:
+                            self._metrics["concurrent_races"] += 1
+                        for other_name, ev in stop_events.items():
+                            if other_name != name:
+                                ev.set()
+                    if winner == name:
+                        yield chunk
+                        yielded_any = True
+        finally:
+            for ev in stop_events.values():
+                ev.set()
+            await self._acancel_tasks(set(tasks.values()))
+
+        if winner is not None and yielded_any:
+            self._apply_outcome(racers_map[winner], ("ok", 0.0))
+        elif racers:
+            for chamber in racers:
+                if chamber["name"] != winner:
+                    self._apply_outcome(chamber, ("network", None))
 
     async def aclose(self) -> None:
         """Asynchronously close the pooled `httpx.AsyncClient`."""
@@ -1523,3 +2377,23 @@ def get_status() -> List[Dict[str, Any]]:
 
 def get_metrics() -> Dict[str, Any]:
     return default_revolver.get_metrics()
+
+
+def export_prometheus() -> str:
+    return default_revolver.export_prometheus()
+
+
+def set_budget(limit_usd: float, cycle_type: str = "monthly", custom_days: int = 30, warning_threshold_pct: float = 80.0, config_path: Optional[str] = None) -> None:
+    return default_revolver.set_budget(limit_usd, cycle_type, custom_days, warning_threshold_pct, config_path)
+
+
+def mark_chamber_paid(name: str, rate_prompt: float, rate_completion: float) -> None:
+    return default_revolver.mark_chamber_paid(name, rate_prompt, rate_completion)
+
+
+def mark_chamber_free(name: str) -> None:
+    return default_revolver.mark_chamber_free(name)
+
+
+def get_budget_status() -> Dict[str, Any]:
+    return default_revolver.get_budget_status()

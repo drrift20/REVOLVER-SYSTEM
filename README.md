@@ -133,6 +133,64 @@ rev = Revolver(judge_instruction=custom_judge)
 
 ---
 
+## 💰 On-Device Budget Guard (Paid API Spending Controls)
+
+Revolver includes a **local, on-device budget guard** that prevents surprise API bills. Configuration lives in a JSON file on the user's device — it never phones home, works offline, and supports both paid and free API users.
+
+### Setup
+
+```python
+from revolver import Revolver
+
+rev = Revolver()
+
+# Add providers & chambers
+rev.add_provider("groq", api_key="YOUR_GROQ_KEY")
+rev.add_chamber(
+    name="Local vLLM",
+    url="http://localhost:8000/v1/chat/completions",
+    api_key="token",
+    model="meta-llama/Llama-3-8B-Instruct",
+)
+
+# Set a monthly spending cap
+rev.set_budget(limit_usd=10.0, cycle_type="monthly", warning_threshold_pct=80.0)
+
+# Tag chambers: paid (with per-1k-token rates) vs free
+rev.mark_chamber_paid("Groq llama-3.3-70b-versatile", rate_prompt=0.59, rate_completion=0.79)
+rev.mark_chamber_free("Local vLLM")
+
+# Check status anytime
+print(rev.get_budget_status())
+# {'cycle_type': 'monthly', 'limit_usd': 10.0, 'spent_usd': 0.0,
+#  'remaining_usd': 10.0, 'warning_threshold_pct': 80.0, ...}
+```
+
+### Behavior
+
+| Event | What happens |
+| :--- | :--- |
+| **Spending approaches limit** | Warning threshold (default 80%) is tracked; you can surface it in your UI |
+| **Limit exhausted** | Paid chambers are skipped automatically; requests fall back to free-only chambers |
+| **No free chambers available** | Returns a busy message indicating budget exhaustion |
+| **Ignore once** | Bypass the cap for the next cycle hour |
+| **Ignore forever** | Permanently disable budget enforcement |
+| **Raise budget** | Increase the limit and continue |
+| **New cycle starts** | Spend resets to 0 automatically (monthly/yearly/custom) |
+
+### Module-level shortcuts
+
+```python
+from revolver import set_budget, mark_chamber_paid, mark_chamber_free, get_budget_status
+
+set_budget(20.0, cycle_type="monthly")
+mark_chamber_paid("Groq llama-3.3-70b-versatile", 0.59, 0.79)
+mark_chamber_free("Local vLLM")
+print(get_budget_status())
+```
+
+---
+
 ## 🧪 Running Tests & Demo
 
 ```bash

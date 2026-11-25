@@ -2,6 +2,9 @@
 Unit tests for Revolver System:
 - Phase 1: Staggered Hedged Racing, EWMA Adaptive Delay, Telemetry
 - Phase 2: Native Async Engine (`AsyncRevolver` via asyncio + httpx)
+- Phase 3: Streaming Race by TTFT (Time-To-First-Token)
+- Phase 4: Complexity-Aware Model Tiering (sprint/heavy)
+- Phase 5: JSON Schema Judge + Prometheus Metrics Export
 """
 
 import asyncio
@@ -12,6 +15,8 @@ import time
 import unittest
 from unittest.mock import MagicMock
 
+from pydantic import BaseModel
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from revolver import (
@@ -20,6 +25,8 @@ from revolver import (
     MIN_HEDGE_DELAY,
     AsyncRevolver,
     Revolver,
+    TIER_HEAVY,
+    TIER_SPRINT,
 )
 
 
@@ -441,6 +448,274 @@ class TestAsyncRevolverPhase2(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(rev._client)
             self.assertFalse(rev._client.is_closed)
         self.assertIsNone(rev._client)
+
+
+def _sse(content: str) -> str:
+    return 'data: {"choices":[{"delta":{"content":"%s"}}]}' % content
+
+
+_SSE_DONE = "data: [DONE]"
+
+
+class _TimedSseResponse:
+    def __init__(self, items):
+        self._items = items
+        self.closed = False
+
+    def iter_lines(self, decode_unicode=True):
+        for delay, line in self._items:
+            if delay:
+                time.sleep(delay)
+            yield line
+
+    def close(self):
+        self.closed = True
+
+
+class TestPhase4Tiering(unittest.TestCase):
+    def test_classify_prompt(self):
+        self.assertEqual(Revolver.classify_prompt("say hi"), TIER_SPRINT)
+        self.assertEqual(Revolver.classify_prompt(""), TIER_SPRINT)
+        self.assertEqual(Revolver.classify_prompt("x" * 600), TIER_HEAVY)
+        self.assertEqual(Revolver.classify_prompt("```python\nprint(1)\n```"), TIER_HEAVY)
+        self.assertEqual(Revolver.classify_prompt("prove this theorem step by step"), TIER_HEAVY)
+
+    def test_select_racers_tiered(self):
+        rev = Revolver()
+        rev.add_chamber("Sprint1", "u1", "k", "m1", tier=TIER_SPRINT)
+        rev.add_chamber("Sprint2", "u2", "k", "m2", tier=TIER_SPRINT)
+        rev.add_chamber("Heavy1", "u3", "k", "m3", tier=TIER_HEAVY)
+        healthy = list(rev._chambers)
+        sprint = rev._select_racers(healthy, [], TIER_SPRINT)
+        self.assertEqual([r["name"] for r in sprint], ["Sprint1", "Sprint2"])
+        heavy = rev._select_racers(healthy, [], TIER_HEAVY)
+        self.assertEqual([r["name"] for r in heavy], ["Heavy1"])
+        rev.close()
+
+    def test_add_provider_tier(self):
+        rev = Revolver()
+        rev.add_provider("groq", api_key="k", models=["llama-3.3-70b-versatile"], tier=TIER_HEAVY)
+        self.assertTrue(all(c["tier"] == TIER_HEAVY for c in rev._chambers))
+        rev.close()
+
+
+class TestPhase3StreamingSync(unittest.TestCase):
+    def setUp(self):
+        self.rev = Revolver(timeout=1.0, hedge_delay=0.05)
+        self.rev.add_chamber("C1", "https://example.com/c1", "k1", "m1")
+        self.rev.add_chamber("C2", "https://example.com/c2", "k2", "m2")
+
+    def tearDown(self):
+        self.rev.close()
+
+    def test_ttft_winner_claims_stream(self):
+        c1_items = [
+            (0.01, _sse("A")),
+            (0.01, _sse("B")),
+            (0, _SSE_DONE),
+        ]
+        c2_items = [
+            (0.2, _sse("C")),
+            (0, _SSE_DONE),
+        ]
+
+        def fake_post(url, headers=None, json=None, timeout=None, stream=None):
+            items = c1_items if url.endswith("/c1") else c2_items
+            return _TimedSseResponse(items)
+
+        self.rev._session.post = fake_post
+        gen = self.rev.ask("Hello", stream=True)
+        chunks = list(gen)
+        self.assertEqual(chunks, ["A", "B"])
+        self.assertNotIn("C", chunks)
+
+    def test_single_chamber_streams(self):
+        self.rev._chambers = self.rev._chambers[:1]
+        items = [(0.01, _sse("Solo")), (0, _SSE_DONE)]
+
+        def fake_post(url, headers=None, json=None, timeout=None, stream=None):
+            return _TimedSseResponse(items)
+
+        self.rev._session.post = fake_post
+        gen = self.rev.ask("Hi", stream=True)
+        self.assertEqual(list(gen), ["Solo"])
+
+    def test_parse_sse_delta(self):
+        self.assertEqual(Revolver._parse_sse_delta(_sse("hello")), "hello")
+        self.assertIsNone(Revolver._parse_sse_delta(_SSE_DONE))
+        self.assertIsNone(Revolver._parse_sse_delta(": comment line"))
+        self.assertIsNone(Revolver._parse_sse_delta("data: not-json"))
+
+
+class TestPhase3StreamingAsync(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.rev = AsyncRevolver(timeout=1.0, hedge_delay=0.05)
+        self.rev.add_chamber("C1", "https://example.com/c1", "k1", "m1")
+        self.rev.add_chamber("C2", "https://example.com/c2", "k2", "m2")
+
+    async def asyncTearDown(self):
+        await self.rev.aclose()
+
+    def _inject_stream_client(self, c1_items, c2_items):
+        def fake_stream(method, url, headers=None, json=None, timeout=None):
+            items = c1_items if url.endswith("/c1") else c2_items
+            return _AsyncSseCM(items)
+
+        mock_client = MagicMock()
+        mock_client.is_closed = False
+        mock_client.stream = fake_stream
+
+        async def fake_aclose():
+            mock_client.is_closed = True
+
+        mock_client.aclose = fake_aclose
+        self.rev._client = mock_client
+        self.rev._client_loop = None
+
+    async def test_async_ttft_winner_claims_stream(self):
+        c1_items = [(0.01, _sse("A")), (0.01, _sse("B")), (0, _SSE_DONE)]
+        c2_items = [(0.2, _sse("C")), (0, _SSE_DONE)]
+        self._inject_stream_client(c1_items, c2_items)
+        gen = await self.rev.ask("Hello", stream=True)
+        chunks = []
+        async for chunk in gen:
+            chunks.append(chunk)
+        self.assertEqual(chunks, ["A", "B"])
+        self.assertNotIn("C", chunks)
+
+
+class _AsyncSseCM:
+    def __init__(self, items):
+        self._items = items
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def aiter_lines(self):
+        for delay, line in self._items:
+            if delay:
+                await asyncio.sleep(delay)
+            yield line
+
+
+class TestPhase5Schema(unittest.TestCase):
+    class Reply(BaseModel):
+        answer: str
+        score: int
+
+    def setUp(self):
+        self.rev = Revolver()
+        self.rev.add_chamber("C1", "https://example.com/c1", "k1", "m1")
+        self.rev.add_chamber("C2", "https://example.com/c2", "k2", "m2")
+
+    def tearDown(self):
+        self.rev.close()
+
+    def test_validate_schema_valid(self):
+        obj, err = self.rev._validate_schema('{"answer": "ok", "score": 5}', self.Reply)
+        self.assertIsNone(err)
+        self.assertEqual(obj.answer, "ok")
+        self.assertEqual(obj.score, 5)
+
+    def test_validate_schema_invalid(self):
+        obj, err = self.rev._validate_schema("{bad json", self.Reply)
+        self.assertIsNone(obj)
+        self.assertIsNotNone(err)
+
+    def test_schema_judge_repair(self):
+        def fake_post(url, headers=None, json=None, timeout=None):
+            msgs = json.get("messages", [])
+            joined = " ".join(m.get("content", "") for m in msgs)
+            if "Invalid draft to repair:" in joined:
+                return _mock_response(
+                    200,
+                    content='{"answer": "repaired", "score": 9}',
+                    usage={"prompt_tokens": 3, "completion_tokens": 2},
+                )
+            return _mock_response(200, content="{invalid json")
+
+        self.rev._session.post = fake_post
+        result = self.rev._apply_schema_validation(self.rev._chambers, "{invalid json", self.Reply)
+        self.assertEqual(result, '{"answer": "repaired", "score": 9}')
+        self.assertEqual(self.rev.get_metrics()["schema_repairs"], 1)
+
+    def test_ask_response_format(self):
+        def fake_post(url, headers=None, json=None, timeout=None):
+            msgs = json.get("messages", [])
+            joined = " ".join(m.get("content", "") for m in msgs)
+            if "Invalid draft to repair:" in joined:
+                return _mock_response(
+                    200,
+                    content='{"answer": "ok", "score": 1}',
+                    usage={"prompt_tokens": 2, "completion_tokens": 2},
+                )
+            return _mock_response(200, content="{bad")
+
+        self.rev._session.post = fake_post
+        reply = self.rev.ask("x", response_format=self.Reply)
+        self.assertEqual(reply, '{"answer": "ok", "score": 1}')
+
+    def test_cost_accounting(self):
+        self.rev.cost_rates = {"m1": (1.0, 2.0), "m2": (0.5, 0.5)}
+        c1 = self.rev._chambers[0]
+        self.rev._apply_outcome(c1, ("ok", 0.5, {"prompt_tokens": 1000, "completion_tokens": 1000}))
+        self.assertEqual(self.rev._chamber_state[c1["name"]]["cost_usd"], 3.0)
+        self.assertEqual(self.rev.get_metrics()["total_cost_usd"], 3.0)
+
+    def test_get_status_includes_cost(self):
+        self.rev.cost_rates = {"m1": (1.0, 2.0)}
+        c1 = self.rev._chambers[0]
+        self.rev._apply_outcome(c1, ("ok", 0.5, {"prompt_tokens": 1000, "completion_tokens": 1000}))
+        st = {s["name"]: s for s in self.rev.get_status()}
+        self.assertIn("cost_usd", st["C1"])
+        self.assertEqual(st["C1"]["cost_usd"], 3.0)
+
+    def test_export_prometheus(self):
+        out = self.rev.export_prometheus()
+        self.assertIn("revolver_requests_total", out)
+        self.assertIn("revolver_requests_saved_total", out)
+        self.assertIn("revolver_engine_cost_usd_total", out)
+        self.assertIn("revolver_engine_prompt_tokens_total", out)
+        self.assertIn("revolver_chamber_health{", out)
+        self.assertIn('revolver_chamber_cost_usd_total{', out)
+
+
+class TestPhase5SchemaAsync(unittest.IsolatedAsyncioTestCase):
+    class Reply(BaseModel):
+        answer: str
+
+    async def asyncSetUp(self):
+        self.rev = AsyncRevolver()
+        self.rev.add_chamber("C1", "https://example.com/c1", "k1", "m1")
+        self.rev.add_chamber("C2", "https://example.com/c2", "k2", "m2")
+
+    async def asyncTearDown(self):
+        await self.rev.aclose()
+
+    async def test_async_schema_repair(self):
+        async def fake_post(url, headers=None, json=None, timeout=None):
+            msgs = json.get("messages", [])
+            joined = " ".join(m.get("content", "") for m in msgs)
+            if "Invalid draft to repair:" in joined:
+                return _mock_response(200, content='{"answer": "ok"}', usage={"prompt_tokens": 1, "completion_tokens": 1})
+            return _mock_response(200, content="{bad")
+
+        mock_client = MagicMock()
+        mock_client.is_closed = False
+        mock_client.post = fake_post
+
+        async def fake_aclose():
+            mock_client.is_closed = True
+
+        mock_client.aclose = fake_aclose
+        self.rev._client = mock_client
+        self.rev._client_loop = None
+
+        result = await self.rev._aapply_schema_validation(self.rev._chambers, "{bad", self.Reply)
+        self.assertEqual(result, '{"answer": "ok"}')
 
 
 if __name__ == "__main__":
