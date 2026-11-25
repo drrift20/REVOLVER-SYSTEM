@@ -904,6 +904,28 @@ class _BaseRevolver:
         except (AttributeError, IndexError, TypeError):
             return None
 
+    @staticmethod
+    def _parse_sse_usage(line: str) -> Optional[Dict[str, int]]:
+        """Extract usage (prompt_tokens, completion_tokens) from an SSE data: line."""
+        if not line or not line.startswith("data:"):
+            return None
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            return None
+        try:
+            data = json.loads(payload)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            return {
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+            }
+        return None
+
     def _try_sanitize_without_judge(self, draft: str) -> Tuple[Optional[str], str, str]:
         """Run Stages 1 & 2 validation/sanitization. Returns (valid_text_or_None, sanitized, reason)."""
         ok, reason = self.validate_draft(draft)
@@ -940,6 +962,29 @@ class _BaseRevolver:
     # Phase 5: Structured JSON Schema Judge
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_json_text(content: str) -> str:
+        """Strip leading/trailing markdown code fences (```json ... ``` or ``` ... ```) before JSON parse."""
+        if not content:
+            return content
+        stripped = content.strip()
+        # Remove opening fence
+        if stripped.startswith("```"):
+            # Find the end of the opening fence line
+            first_newline = stripped.find("\n")
+            if first_newline != -1:
+                stripped = stripped[first_newline + 1 :]
+            else:
+                stripped = ""
+        # Remove closing fence
+        if stripped.rstrip().endswith("```"):
+            last_newline = stripped.rfind("\n")
+            if last_newline != -1:
+                stripped = stripped[:last_newline]
+            else:
+                stripped = ""
+        return stripped.strip()
+
     def _validate_schema(
         self,
         content: str,
@@ -954,7 +999,7 @@ class _BaseRevolver:
         if not content:
             return None, "empty response"
         try:
-            data = json.loads(content)
+            data = json.loads(self._extract_json_text(content))
         except (ValueError, TypeError) as exc:
             return None, f"invalid JSON: {exc}"
         try:
@@ -981,7 +1026,7 @@ class _BaseRevolver:
             if obj is not None:
                 with self._health_lock:
                     self._metrics["schema_repairs"] += 1
-                return current  # already valid JSON
+                return self._extract_json_text(current)  # already valid JSON, strip fences
 
             for judge in ranked_chambers[: self.judge_max_attempts]:
                 log.info("Revolver Schema Judge invoked on %s (error: %s)", judge["name"], error)
@@ -994,7 +1039,7 @@ class _BaseRevolver:
                 self._apply_outcome(judge, outcome)
                 if content:
                     cleaned = self.sanitize_draft(content)
-                    candidate = cleaned or content
+                    candidate = self._extract_json_text(cleaned or content)
                     obj2, _ = self._validate_schema(candidate, response_format)
                     if obj2 is not None:
                         with self._health_lock:
@@ -1570,6 +1615,7 @@ class Revolver(_BaseRevolver):
         racers = self._select_racers(healthy, cooled, classification)
 
         # Budget guard: if paid racers are blocked, fall back to free-only chambers.
+        budget_exhausted = False
         if racers and self._budget_guard is not None:
             paid_racers = [c for c in racers if self._budget_guard.is_paid(c["name"])]
             if paid_racers:
@@ -1577,6 +1623,7 @@ class Revolver(_BaseRevolver):
                     self._budget_check()
                 except BudgetExceeded:
                     log.warning("Budget exhausted; skipping paid chambers, falling back to free-only")
+                    budget_exhausted = True
                     racers = [c for c in racers if not self._budget_guard.is_paid(c["name"])]
                     if not racers:
                         return BUSY_MESSAGE + " (budget exhausted, no free chambers available)"
@@ -1596,6 +1643,16 @@ class Revolver(_BaseRevolver):
         for chamber in healthy + cooled:
             if chamber["name"] in attempted_names:
                 continue
+            # Budget guard: skip paid chambers if budget is exhausted
+            if self._budget_guard is not None and self._budget_guard.is_paid(chamber["name"]):
+                if budget_exhausted:
+                    continue
+                try:
+                    self._budget_check()
+                except BudgetExceeded:
+                    log.warning("Budget exhausted; skipping paid chamber %s in fallback loop", chamber["name"])
+                    budget_exhausted = True
+                    continue
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 break
@@ -1657,8 +1714,11 @@ class Revolver(_BaseRevolver):
                     if not raw_line:
                         continue
                     chunk = self._parse_sse_delta(raw_line)
+                    usage = self._parse_sse_usage(raw_line)
                     if chunk:
                         result_q.put(("chunk", name, chunk))
+                    if usage:
+                        result_q.put(("usage", name, usage))
             except Exception as exc:  # noqa: BLE001 - stream failures are reported as chunks/errors
                 log.warning("Streaming chamber %s errored: %s", name, exc)
                 result_q.put(("error", name, str(exc)))
@@ -1679,6 +1739,8 @@ class Revolver(_BaseRevolver):
         winner: Optional[str] = None
         finished: Set[str] = set()
         yielded_any = False
+        started = time.monotonic()
+        winner_usage: Optional[Dict[str, int]] = None
         try:
             while len(finished) < len(racers):
                 remaining = deadline - time.monotonic()
@@ -1695,6 +1757,11 @@ class Revolver(_BaseRevolver):
                     continue
                 if kind == "error":
                     finished.add(item[1])
+                    continue
+                if kind == "usage":
+                    _, name, usage = item
+                    if winner is not None and name == winner:
+                        winner_usage = usage
                     continue
                 if kind == "chunk":
                     _, name, chunk = item
@@ -1714,8 +1781,9 @@ class Revolver(_BaseRevolver):
                 ev.set()
 
         # Best-effort health accounting for the streaming race.
+        elapsed = time.monotonic() - started
         if winner is not None and yielded_any:
-            self._apply_outcome(racers_map[winner], ("ok", 0.0))
+            self._apply_outcome(racers_map[winner], ("ok", elapsed, winner_usage))
         elif racers:
             for chamber in racers:
                 if chamber["name"] != winner:
@@ -2124,7 +2192,7 @@ class AsyncRevolver(_BaseRevolver):
             if obj is not None:
                 with self._health_lock:
                     self._metrics["schema_repairs"] += 1
-                return current
+                return self._extract_json_text(current)  # already valid JSON, strip fences
 
             for judge in ranked_chambers[: self.judge_max_attempts]:
                 log.info("Async Revolver Schema Judge invoked on %s (error: %s)", judge["name"], error)
@@ -2137,7 +2205,7 @@ class AsyncRevolver(_BaseRevolver):
                 self._apply_outcome(judge, outcome)
                 if content:
                     cleaned = self.sanitize_draft(content)
-                    candidate = cleaned or content
+                    candidate = self._extract_json_text(cleaned or content)
                     obj2, _ = self._validate_schema(candidate, response_format)
                     if obj2 is not None:
                         with self._health_lock:
@@ -2193,6 +2261,7 @@ class AsyncRevolver(_BaseRevolver):
         racers = self._select_racers(healthy, cooled, classification)
 
         # Budget guard: if paid racers are blocked, fall back to free-only chambers.
+        budget_exhausted = False
         if racers and self._budget_guard is not None:
             paid_racers = [c for c in racers if self._budget_guard.is_paid(c["name"])]
             if paid_racers:
@@ -2200,6 +2269,7 @@ class AsyncRevolver(_BaseRevolver):
                     self._budget_check()
                 except BudgetExceeded:
                     log.warning("Async budget exhausted; skipping paid chambers, falling back to free-only")
+                    budget_exhausted = True
                     racers = [c for c in racers if not self._budget_guard.is_paid(c["name"])]
                     if not racers:
                         return BUSY_MESSAGE + " (budget exhausted, no free chambers available)"
@@ -2219,6 +2289,18 @@ class AsyncRevolver(_BaseRevolver):
         for chamber in healthy + cooled:
             if chamber["name"] in attempted_names:
                 continue
+            # Budget guard: skip paid chambers if budget is exhausted
+            if self._budget_guard is not None and self._budget_guard.is_paid(chamber["name"]):
+                if budget_exhausted:
+                    continue
+                try:
+                    self._budget_check()
+                except BudgetExceeded:
+                    log.warning(
+                        "Async budget exhausted; skipping paid chamber %s in fallback loop", chamber["name"]
+                    )
+                    budget_exhausted = True
+                    continue
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 break
@@ -2281,8 +2363,11 @@ class AsyncRevolver(_BaseRevolver):
                         if not raw_line:
                             continue
                         chunk = self._parse_sse_delta(raw_line)
+                        usage = self._parse_sse_usage(raw_line)
                         if chunk:
                             await result_q.put(("chunk", name, chunk))
+                        if usage:
+                            await result_q.put(("usage", name, usage))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -2298,6 +2383,8 @@ class AsyncRevolver(_BaseRevolver):
         winner: Optional[str] = None
         finished: Set[str] = set()
         yielded_any = False
+        started = time.monotonic()
+        winner_usage: Optional[Dict[str, int]] = None
         try:
             while len(finished) < len(racers):
                 remaining = deadline - time.monotonic()
@@ -2314,6 +2401,11 @@ class AsyncRevolver(_BaseRevolver):
                     continue
                 if kind == "error":
                     finished.add(item[1])
+                    continue
+                if kind == "usage":
+                    _, name, usage = item
+                    if winner is not None and name == winner:
+                        winner_usage = usage
                     continue
                 if kind == "chunk":
                     _, name, chunk = item
@@ -2334,7 +2426,8 @@ class AsyncRevolver(_BaseRevolver):
             await self._acancel_tasks(set(tasks.values()))
 
         if winner is not None and yielded_any:
-            self._apply_outcome(racers_map[winner], ("ok", 0.0))
+            elapsed = time.monotonic() - started
+            self._apply_outcome(racers_map[winner], ("ok", elapsed, winner_usage))
         elif racers:
             for chamber in racers:
                 if chamber["name"] != winner:
@@ -2367,7 +2460,7 @@ def add_provider(*args, **kwargs):
     return default_revolver.add_provider(*args, **kwargs)
 
 
-def ask(user_message: str, *args, **kwargs) -> str:
+def ask(user_message: str, *args, **kwargs) -> Union[str, Generator[str, None, None]]:
     return default_revolver.ask(user_message, *args, **kwargs)
 
 
