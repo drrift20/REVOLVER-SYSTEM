@@ -261,7 +261,7 @@ def tag_chambers_by_tier(rev: Revolver, tier_map: Optional[Dict[str, str]] = Non
     sprint_markers = ("flash", "lite", "mini", "8b", "20b", "small", "fast")
     heavy_markers = ("pro", "70b", "120b", "opus", "o1", "large", "max")
     for ch in rev._chambers:
-        model_lower = ch["model"].lower()
+        model_lower = (ch.get("model") or "").lower()
         if any(m in model_lower for m in heavy_markers):
             ch["tier"] = TIER_HEAVY
         elif any(m in model_lower for m in sprint_markers):
@@ -324,6 +324,64 @@ def print_panel(title: str, body: str) -> None:
 # ---------------------------------------------------------------------------
 # Brain / Library Mode commands
 # ---------------------------------------------------------------------------
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """revolver ask — send a prompt directly to Revolver (supports pipes & streaming)."""
+    prompt = getattr(args, "prompt", None)
+    piped_data = ""
+    if not sys.stdin.isatty():
+        try:
+            piped_data = sys.stdin.read().strip()
+        except Exception:
+            piped_data = ""
+
+    if not prompt and not piped_data:
+        print('❌ No prompt provided. Usage: revolver ask "your prompt" or pipe via stdin.', file=sys.stderr)
+        return 1
+
+    if prompt and piped_data:
+        full_prompt = f"{prompt}\n\nContext:\n{piped_data}"
+    elif prompt:
+        full_prompt = prompt
+    else:
+        full_prompt = piped_data
+
+    rev = build_revolver(race_mode=getattr(args, "race_mode", "hedged"))
+    tag_chambers_by_tier(rev)
+
+    if not rev._chambers:
+        print(
+            "❌ No chambers registered. Set environment variables (e.g. GROQ_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY) "
+            "or run 'revolver discover'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    tier = getattr(args, "tier", None)
+    if tier:
+        rev._chambers = [c for c in rev._chambers if c.get("tier") == tier]
+        if not rev._chambers:
+            print(f"❌ No chambers available with tier '{tier}'.", file=sys.stderr)
+            return 1
+
+    try:
+        if getattr(args, "stream", False):
+            chunks = rev.ask(full_prompt, system_prompt=getattr(args, "system", None), stream=True)
+            for chunk in chunks:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+            sys.stdout.write("\n")
+        else:
+            reply = rev.ask(full_prompt, system_prompt=getattr(args, "system", None))
+            print(reply)
+        return 0
+    except BudgetExceeded as exc:
+        print(f"⚠️  Budget exhausted: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"❌ Error: {exc}", file=sys.stderr)
+        return 1
+
 
 def cmd_status(args: argparse.Namespace) -> int:
     """revolver status — show chamber health, latency, cost, budget."""
@@ -996,28 +1054,20 @@ class SWEAgent:
     # -- LLM calls with tier-aware routing --------------------------------
 
     def _llm_plan(self, task: str, context: str) -> str:
-        """Planning call using heavy-tier chambers."""
-        racers = select_chambers_by_tier(self.rev, TIER_HEAVY, self.rev._chambers[:], [])
-        if not racers:
-            racers = self.rev._chambers[:2]
-        messages = [
-            {"role": "system", "content": self.rev.system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    "You are an expert software engineer creating an implementation plan.\n"
-                    f"TASK: {task}\n\n"
-                    f"CONTEXT (codebase index):\n{context}\n\n"
-                    "Produce a concise, ordered multi-step plan. Each step should name the "
-                    "file(s) to touch and the change to make. Keep it under 200 words."
-                ),
-            },
-        ]
-        # Use the heaviest chamber directly for planning.
-        chamber = racers[0]
-        content, outcome = self.rev._call_chamber(chamber, messages)
-        self.rev._apply_outcome(chamber, outcome)
-        return content or ""
+        """Planning call using Revolver hedged race and fallback."""
+        prompt = (
+            "You are an expert software engineer creating an implementation plan.\n"
+            f"TASK: {task}\n\n"
+            f"CONTEXT (codebase index):\n{context}\n\n"
+            "Produce a concise, ordered multi-step plan. Each step should name the "
+            "file(s) to touch and the change to make. Keep it under 200 words."
+        )
+        try:
+            content = self.rev.ask(user_message=prompt, system_prompt=self.rev.system_prompt)
+            return str(content) if content else ""
+        except Exception as exc:
+            print(f"⚠️  Planning call encountered error: {exc}")
+            return ""
 
     def _llm_decide(
         self,
@@ -1027,18 +1077,11 @@ class SWEAgent:
         available_tools: str,
     ) -> Union[AgentAction, Dict[str, Any], None]:
         """
-        Ask Revolver (sprint tier for fast inspection, heavy for edits/planning)
-        to pick the next tool action as JSON.
+        Ask Revolver to pick the next tool action as JSON.
+        Uses response_format with Schema Judge validation and auto-healing.
         """
-        # Decide tier: complex reasoning → heavy, simple lookup → sprint.
-        needs_heavy = any(k in task.lower() for k in ("debug", "fix", "architect", "design", "refactor", "plan"))
-        tier = TIER_HEAVY if needs_heavy else TIER_SPRINT
-        racers = select_chambers_by_tier(self.rev, tier, self.rev._chambers[:], [])
-        if not racers:
-            racers = self.rev._chambers[:2]
-
         system_prompt = (
-            "You are an autonomous SWE agent. Respond ONLY with a JSON object matching this schema:\n"
+            "You are an autonomous SWE agent. Respond ONLY with a valid JSON object matching this schema:\n"
             '{"tool": "<tool_name>", "args": {...}, "reasoning": "<why>"}\n\n'
             f"Available tools:\n{available_tools}\n\n"
             "Rules:\n"
@@ -1056,20 +1099,33 @@ class SWEAgent:
             "Choose the next single action. Respond with ONLY the JSON object."
         )
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ]
-
-        chamber = racers[0]
-        content, outcome = self.rev._call_chamber(chamber, messages)
-        self.rev._apply_outcome(chamber, outcome)
-
-        if not content:
+        try:
+            raw_result = self.rev.ask(
+                user_message=user_content,
+                system_prompt=system_prompt,
+                response_format=AgentAction if HAS_PYDANTIC else None,
+            )
+        except Exception as exc:
+            print(f"⚠️  LLM decide call encountered error: {exc}")
             return None
 
-        # Try to parse JSON from the response (strip fences).
-        raw = self.rev.sanitize_draft(content)
+        if not raw_result:
+            return None
+
+        if HAS_PYDANTIC and isinstance(raw_result, AgentAction):
+            return raw_result
+
+        # If raw_result is a dict
+        if isinstance(raw_result, dict):
+            if HAS_PYDANTIC:
+                try:
+                    return AgentAction(**raw_result)
+                except Exception:
+                    pass
+            return raw_result
+
+        # If raw_result is a string (e.g. if HAS_PYDANTIC is False or ask returned string)
+        raw = self.rev.sanitize_draft(str(raw_result))
         raw = self._strip_json_fences(raw)
         try:
             data = json.loads(raw)
@@ -1077,6 +1133,16 @@ class SWEAgent:
                 return AgentAction(**data)
             return data
         except (json.JSONDecodeError, ValidationError, TypeError) as exc:
+            # Fallback regex extraction if there's surrounding text
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                    if HAS_PYDANTIC:
+                        return AgentAction(**data)
+                    return data
+                except Exception:
+                    pass
             print(f"⚠️  Could not parse agent action JSON: {exc}")
             print(f"   Raw response: {raw[:300]}")
             return None
@@ -1186,12 +1252,12 @@ class SWEAgent:
 
             if tool == "git_diff":
                 repo = self.workspace.get_repo(repo_alias)
-                code, out, err = repo.run_command("git diff", confirm=self.auto)
+                code, out, err = repo.run_command("git diff", confirm=False)
                 return code == 0, out or err, None
 
             if tool == "git_status":
                 repo = self.workspace.get_repo(repo_alias)
-                code, out, err = repo.run_command("git status", confirm=self.auto)
+                code, out, err = repo.run_command("git status", confirm=False)
                 return code == 0, out or err, None
 
             if tool == "done":
@@ -1212,25 +1278,40 @@ class SWEAgent:
         test_commands: Optional[List[str]] = None,
     ) -> Tuple[bool, str]:
         """Run verification commands (tests/linters/build) in a repo."""
+        repo = self.workspace.get_repo(repo_alias)
         if not test_commands:
-            # Auto-detect common test commands.
-            repo = self.workspace.get_repo(repo_alias)
-            candidates = [
-                "python -m pytest -q",
-                "python -m unittest discover -v",
-                "python -m unittest test_revolver.py -v",
-                "npm test",
-            ]
             test_commands = []
-            for cmd in candidates:
-                # Check if the command makes sense (e.g., pytest exists or test files exist).
-                test_commands.append(cmd)
+            root = repo.root
+
+            has_revolver_test = (root / "test_revolver.py").exists()
+            has_pytest_config = (root / "pytest.ini").exists() or (root / "pyproject.toml").exists()
+            has_tests_dir = (root / "tests").is_dir() or (root / "test").is_dir()
+
+            if has_revolver_test:
+                test_commands.append("python -m unittest test_revolver.py -v")
+            elif has_pytest_config or has_tests_dir:
+                try:
+                    import pytest  # noqa: F401
+                    test_commands.append("python -m pytest -q")
+                except ImportError:
+                    test_commands.append("python -m unittest discover -v")
+
+            pkg_json = root / "package.json"
+            if pkg_json.exists():
+                try:
+                    pkg_data = json.loads(pkg_json.read_text(encoding="utf-8"))
+                    if "scripts" in pkg_data and "test" in pkg_data["scripts"]:
+                        test_commands.append("npm test")
+                except Exception:
+                    pass
+
+        if not test_commands:
+            return True, "No test commands detected or configured; verification passed."
 
         all_ok = True
         outputs: List[str] = []
         for cmd in test_commands:
-            repo = self.workspace.get_repo(repo_alias)
-            code, out, err = repo.run_command(cmd, confirm=self.auto)
+            code, out, err = repo.run_command(cmd, confirm=not self.auto)
             outputs.append(f"=== {cmd} ===\n{out}\n{err}")
             if code != 0:
                 all_ok = False
@@ -1291,9 +1372,14 @@ class SWEAgent:
 
             # Execute.
             success, output, hint = self._execute_action(action)
+            action_tool = (
+                action.tool
+                if (HAS_PYDANTIC and isinstance(action, AgentAction))
+                else (action.get("tool", "") if isinstance(action, dict) else getattr(action, "tool", ""))
+            )
             self.history.append({
                 "step": self.step,
-                "tool": action.tool if HAS_PYDANTIC else action.get("tool", ""),
+                "tool": action_tool,
                 "success": success,
                 "output": output[:500],
             })
@@ -1303,8 +1389,8 @@ class SWEAgent:
                 # Run verification.
                 repo_alias = (
                     action.args.get("repo", "primary")
-                    if HAS_PYDANTIC and isinstance(action, AgentAction)
-                    else action.get("args", {}).get("repo", "primary")
+                    if (HAS_PYDANTIC and isinstance(action, AgentAction))
+                    else (action.get("args", {}).get("repo", "primary") if isinstance(action, dict) else getattr(action, "args", {}).get("repo", "primary"))
                 )
                 ok, verify_out = self._verify(repo_alias, test_commands)
                 print(f"\n🔍 Verification:\n{verify_out}")
@@ -1320,11 +1406,11 @@ class SWEAgent:
 
             print(f"   ✅ Action succeeded.")
             # Periodically re-verify after meaningful edits.
-            if action.tool if HAS_PYDANTIC else action.get("tool", "") in ("write_file", "edit_file", "delete_file"):
+            if action_tool in ("write_file", "edit_file", "delete_file"):
                 repo_alias = (
                     action.args.get("repo", "primary")
-                    if HAS_PYDANTIC and isinstance(action, AgentAction)
-                    else action.get("args", {}).get("repo", "primary")
+                    if (HAS_PYDANTIC and isinstance(action, AgentAction))
+                    else (action.get("args", {}).get("repo", "primary") if isinstance(action, dict) else getattr(action, "args", {}).get("repo", "primary"))
                 )
                 ok, verify_out = self._verify(repo_alias, test_commands)
                 if not ok:
@@ -1353,9 +1439,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
 
     print("\n🤖 Revolver Agent — Interactive Mode")
     print(f"   Workspace: {workspace.root}")
-    print("   Commands: /read <repo:path> | /write <repo:path> | /edit <repo:path> | /run <cmd> |")
-    print("             /ls <repo:path> | /repo add <alias> <path> | /repo list | /undo |")
-    print("             /discover | /prune [--days N] [--force] [--apply] | /swe <task> | /quit\n")
+    print("   Commands: /help | /status | /budget | /clear | /diff | /swe <task> | /run <cmd> |")
+    print("             /ls <path> | /read <path> | /write <path> | /edit <path> | /undo | /quit\n")
 
     rev = build_revolver(race_mode=args.race_mode)
     tag_chambers_by_tier(rev)
@@ -1374,6 +1459,72 @@ def cmd_agent(args: argparse.Namespace) -> int:
         if user_input in ("/quit", "/exit", "quit", "exit"):
             print("👋 Agent exited.")
             return 0
+
+        if user_input in ("/help", "help", "?"):
+            print("\n" + "=" * 62)
+            print("🤖 REVOLVER AGENT — INTERACTIVE COMMANDS")
+            print("=" * 62)
+            print("SWE & Coding:")
+            print("  /swe <task>                  Run autonomous plan → execute → verify loop")
+            print("  /undo                        Undo last workspace file modification")
+            print("  /diff [alias]                View git diff of repo (default: primary)")
+            print("  /run <cmd>                   Run shell command in workspace repo")
+            print("Workspace & Files:")
+            print("  /ls [alias:path]             List files in directory")
+            print("  /read <alias:path>           Display file contents")
+            print("  /write <alias:path>          Write/create file interactively")
+            print("  /edit <alias:path>           Find and replace string in file")
+            print("  /repo list                   List registered repositories")
+            print("  /repo add <alias> <path>     Mount a new repository")
+            print("  /repo remove <alias>         Unmount a repository")
+            print("Brain & Providers:")
+            print("  /status                      Show live chamber health, latency, & cost")
+            print("  /budget                      Show current BudgetGuard spending & limits")
+            print("  /discover                    Refresh models & discover new chambers")
+            print("  /prune [--days N] [--apply]  Detect and prune dead model endpoints")
+            print("Session:")
+            print("  /clear                       Clear terminal screen")
+            print("  /quit, /exit                 Exit interactive agent session")
+            print("  <message>                    Send prompt directly to Revolver brain")
+            print("=" * 62 + "\n")
+            continue
+
+        if user_input == "/status":
+            cmd_status(argparse.Namespace(budget_limit=None))
+            continue
+
+        if user_input == "/budget":
+            budget = rev.get_budget_status()
+            print("\n💰 Budget Status:")
+            if not budget.get("budget_configured"):
+                print("   No budget configured. Run 'revolver budget --set-limit <USD>' to configure.")
+            else:
+                print(f"   Cycle    : {budget.get('cycle_type', 'N/A')}")
+                print(f"   Limit    : ${budget.get('limit_usd', 0.0):.2f}")
+                print(f"   Spent    : ${budget.get('spent_usd', 0.0):.4f}")
+                print(f"   Remaining: ${budget.get('remaining_usd', 0.0):.4f}")
+            print()
+            continue
+
+        if user_input == "/clear":
+            os.system("cls" if os.name == "nt" else "clear")
+            continue
+
+        if user_input == "/diff" or user_input.startswith("/diff "):
+            parts = user_input.split()
+            alias = parts[1] if len(parts) > 1 else "primary"
+            try:
+                repo = workspace.get_repo(alias)
+                code, out, err = repo.run_command("git diff", confirm=False)
+                if out:
+                    print(f"\n--- [{alias}] git diff ---\n{out}\n--- end diff ---\n")
+                elif err:
+                    print(f"⚠️ {err}")
+                else:
+                    print(f"   [{alias}] Working tree clean (no uncommitted changes).")
+            except KeyError as exc:
+                print(f"❌ {exc}")
+            continue
 
         # --- Repo management ---
         if user_input.startswith("/repo "):
@@ -1845,6 +1996,15 @@ def build_parser() -> argparse.ArgumentParser:
         description="Revolver System — Full Autonomous SWE & Multi-Repo Agent (Linux & Windows)",
     )
     sub = parser.add_subparsers(dest="command", help="Available commands")
+
+    # --- ask ---
+    p_ask = sub.add_parser("ask", help="Send a prompt directly to Revolver (supports pipes & streaming)")
+    p_ask.add_argument("prompt", nargs="?", default=None, help="User prompt (or piped from stdin)")
+    p_ask.add_argument("--stream", action="store_true", help="Stream response tokens in real-time (TTFT race)")
+    p_ask.add_argument("--system", default=None, help="Custom system prompt")
+    p_ask.add_argument("--race-mode", choices=["hedged", "concurrent"], default="hedged", help="Race mode")
+    p_ask.add_argument("--tier", choices=["sprint", "heavy"], default=None, help="Filter chambers to sprint or heavy tier")
+    p_ask.set_defaults(func=cmd_ask)
 
     # --- status ---
     p_status = sub.add_parser("status", help="Show chamber health, latency, cost")

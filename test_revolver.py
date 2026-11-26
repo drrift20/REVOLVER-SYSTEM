@@ -8,8 +8,12 @@ Unit tests for Revolver System:
 """
 
 import asyncio
+import json
 import os
+from pathlib import Path
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -879,6 +883,124 @@ class TestPhase6UniversalDiscovery(unittest.TestCase):
         # Auto-registered as free (0.0) without blocking usage.
         self.assertFalse(rev._budget_guard.is_paid(name))
         rev.close()
+
+
+class TestSWEAgentAndCLI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="revolver_swe_test_"))
+        import revolver
+        import revolver_cli
+        self.R = revolver
+        self.CLI = revolver_cli
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_budget_cycle_expired_unconfigured_does_not_reset(self):
+        """Unconfigured budget (limit_usd=None) must not expire and wipe spent_usd on status check."""
+        bg = self.R.BudgetGuard(config_path=str(self.tmp / "test_budget.json"))
+        bg.record_spend(0.05)
+        self.assertEqual(bg.config["spent_usd"], 0.05)
+        st = bg.get_status()
+        self.assertEqual(st["spent_usd"], 0.05)
+
+    def test_swe_agent_verify_auto_detection(self):
+        """SWEAgent._verify should detect tests accurately based on repo structure."""
+        repo_dir = self.tmp / "repo"
+        repo_dir.mkdir()
+        ws = self.CLI.MultiRepoWorkspace(self.tmp)
+        ws.add_repo("sub", str(repo_dir))
+
+        rev = self.R.Revolver(persist_state=False)
+        agent = self.CLI.SWEAgent(ws, rev, auto=True)
+
+        # 1. Empty repo: no test commands detected, verification passes cleanly
+        ok, out = agent._verify("sub")
+        self.assertTrue(ok)
+        self.assertIn("No test commands", out)
+
+        # 2. Repo with package.json
+        pkg = repo_dir / "package.json"
+        pkg.write_text(json.dumps({"scripts": {"test": "echo test_ok"}}), encoding="utf-8")
+        ok, out = agent._verify("sub")
+        self.assertIn("npm test", out)
+
+    def test_swe_agent_operator_precedence_and_history(self):
+        """Only write/edit/delete actions should trigger verification, not read actions."""
+        ws = self.CLI.MultiRepoWorkspace(self.tmp)
+        rev = self.R.Revolver(persist_state=False)
+        agent = self.CLI.SWEAgent(ws, rev, auto=True)
+
+        # Create a test file
+        test_file = self.tmp / "hello.txt"
+        test_file.write_text("hello world\n", encoding="utf-8")
+
+        # Mock _llm_decide to return a read action, then a done action
+        actions = [
+            self.CLI.AgentAction(tool="read_file", args={"path": "hello.txt"}, reasoning="check file"),
+            self.CLI.AgentAction(tool="done", args={"summary": "all done"}, reasoning="finished"),
+        ]
+        agent._llm_decide = lambda *args, **kwargs: actions.pop(0)
+        agent._llm_plan = lambda *args, **kwargs: "step 1"
+
+        verify_calls = []
+        def mock_verify(*args, **kwargs):
+            verify_calls.append(True)
+            return True, "mock verify ok"
+        agent._verify = mock_verify
+
+        success = agent.run("read hello.txt", index_first=False)
+        self.assertTrue(success)
+        # Verify should ONLY be called once on 'done', NOT on 'read_file'
+        self.assertEqual(len(verify_calls), 1)
+
+    def test_swe_agent_read_only_git_confirm_false(self):
+        """git_diff and git_status should never require confirmation even if auto=False."""
+        ws = self.CLI.MultiRepoWorkspace(self.tmp)
+        rev = self.R.Revolver(persist_state=False)
+        agent = self.CLI.SWEAgent(ws, rev, auto=False)
+
+        confirm_passed = []
+        primary_repo = ws.primary
+        def mock_run_command(cmd, confirm=False):
+            confirm_passed.append(confirm)
+            return 0, "mock git output", ""
+        primary_repo.run_command = mock_run_command
+
+        action_diff = self.CLI.AgentAction(tool="git_diff", args={}, reasoning="check diff")
+        agent._execute_action(action_diff)
+        self.assertEqual(confirm_passed[-1], False)
+
+        action_status = self.CLI.AgentAction(tool="git_status", args={}, reasoning="check status")
+        agent._execute_action(action_status)
+        self.assertEqual(confirm_passed[-1], False)
+
+    def test_cmd_ask(self):
+        """revolver ask subcommand tests."""
+        # 1. No prompt and isatty
+        parser = self.CLI.build_parser()
+        args = parser.parse_args(["ask"])
+        code = self.CLI.cmd_ask(args)
+        self.assertEqual(code, 1)
+
+        # 2. Ask with a prompt when chambers exist
+        rev = self.R.Revolver(persist_state=False)
+        rev._chambers = [{"name": "c1", "tier": "sprint", "model": "mock-model"}]
+        rev.ask = lambda *args, **kwargs: "echo answer"
+
+        orig_build = self.CLI.build_revolver
+        self.CLI.build_revolver = lambda **kwargs: rev
+        try:
+            args = parser.parse_args(["ask", "What is 2+2?"])
+            import io
+            from contextlib import redirect_stdout
+            f = io.StringIO()
+            with redirect_stdout(f):
+                code = self.CLI.cmd_ask(args)
+            self.assertEqual(code, 0)
+            self.assertIn("echo answer", f.getvalue())
+        finally:
+            self.CLI.build_revolver = orig_build
 
 
 if __name__ == "__main__":

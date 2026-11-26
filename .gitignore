@@ -45,3 +45,8 @@ ENV/
 .pytest_cache/
 .ruff_cache/
 *.log
+
+# Revolver local state & runtime files
+revolver_budget.json
+revolver_state.json
+.revolver/

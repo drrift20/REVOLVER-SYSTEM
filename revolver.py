@@ -177,7 +177,7 @@ class BudgetGuard:
 
     def _cycle_expired(self) -> bool:
         if not self.config["cycle_start"] or not self.config["cycle_type"] or self.config["limit_usd"] is None:
-            return True
+            return False
         start = datetime.fromisoformat(self.config["cycle_start"])
         now = datetime.now()
         if self.config["cycle_type"] == "monthly":

@@ -236,16 +236,37 @@ rev.replace_pruned_with_healthy(apply=True)   # pull verified healthy models int
 Pruned chambers are removed from racing/hedging; replacements are pulled from
 cached/fresh discovery. Conservative defaults mean a brief 429 never wipes a good model.
 
-### CLI
+### CLI Commands
+
+Revolver comes with a comprehensive CLI interface for querying, managing chambers, and running autonomous agent loops:
 
 ```bash
-revolver discover            # auto-detect keys/endpoints, fetch models, build/refresh chambers
-revolver discover --provider deepseek --api-key ... --base-url ...
-revolver prune               # dry-run dead-model pruning + replacement
+# Direct Ask (supports streaming, custom tiers, and piped stdin)
+revolver ask "Explain how hedged racing works"
+git diff | revolver ask "Generate a conventional commit message"
+revolver ask --stream --tier sprint "Give me 3 fast project ideas"
+
+# Chamber & Budget Management
+revolver status              # View live chamber health, latency, cost, and quota metrics
+revolver budget              # Check spending, cycle limit, and provider rate breakdown
+revolver discover            # Auto-detect keys/endpoints, fetch models, build/refresh chambers
+revolver prune               # Dry-run dead-model pruning + healthy replacement
 revolver prune --days 5 --apply
+
+# Autonomous SWE & Interactive Agent
+revolver agent               # Interactive coding agent with Revolver brain
+revolver swe "Fix issue #42" # Autonomous SWE loop (Plan → Execute → Verify)
 ```
 
-Inside `revolver agent`, use `/discover` and `/prune [--days N] [--force] [--apply]`.
+Inside `revolver agent`, interact with the built-in command palette:
+- `/help` — Display all available agent and workspace commands
+- `/status` — View real-time chamber HP, latency, and success rates
+- `/budget` — Inspect current local BudgetGuard spending
+- `/diff` — View git diff of the repository working tree
+- `/clear` — Clear the terminal screen
+- `/swe <task>` — Launch an autonomous SWE agent loop on a task
+- `/undo` — Revert the last file change using workspace snapshots
+- `/read`, `/write`, `/edit`, `/ls`, `/run` — Safe workspace tools
 
 ---
 
