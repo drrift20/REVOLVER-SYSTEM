@@ -6,6 +6,8 @@ Provides two modes on top of revolver.py (core logic untouched):
   1. Brain / Library Mode
      revolver status        — inspect chamber health, latency, cost, budget
      revolver budget        — view / configure on-device budget guard
+     revolver discover      — auto-detect providers, fetch models, build/refresh chambers
+     revolver prune         — prune dead models + replace with healthy chambers
      revolver test          — run built-in self-test suite
 
   2. CLI Agent Mode
@@ -40,6 +42,13 @@ try:
         Revolver,
         TIER_HEAVY,
         TIER_SPRINT,
+        detect_provider,
+        discover_provider_models,
+        classify_model_tier,
+        CHAMBERS_STATE_PATH,
+        MODELS_CACHE_PATH,
+        DEFAULT_MAX_DOWN_DAYS,
+        DEFAULT_MIN_CONSECUTIVE_FAILURES,
     )
 except ImportError as exc:  # pragma: no cover - helpful CLI error
     print(f"❌ Cannot import revolver module: {exc}")
@@ -84,6 +93,12 @@ PROVIDER_ENV_KEYS: Dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "cerebras": "CEREBRAS_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+    "xai": "XAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "ollama": "OLLAMA_API_KEY",
 }
 
 # Reverse map: env var -> provider.
@@ -403,6 +418,174 @@ def cmd_budget(args: argparse.Namespace) -> int:
         tag = "PAID" if info.get("paid") else "FREE"
         print(f"      {name}: {tag}")
 
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Universal discovery & dead-model pruning (Phase 6)
+# ---------------------------------------------------------------------------
+
+def gather_discovery_targets(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Auto-detect every configured provider/endpoint for discovery.
+
+    Sources (merged, de-duplicated by provider name):
+      * environment variables / config api_keys for all known providers
+      * custom ``api_keys`` entries in ~/.revolver/config.json
+      * ``custom_endpoints``: [{name, base_url, api_key}] in config.json
+    """
+    targets: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for provider in PROVIDER_ENV_KEYS:
+        key = get_api_key(provider)
+        if key:
+            targets.append({"provider": provider, "api_key": key, "base_url": None})
+            seen.add(provider)
+
+    api_keys = config.get("api_keys", {}) if isinstance(config, dict) else {}
+    if isinstance(api_keys, dict):
+        for name, key in api_keys.items():
+            lname = str(name).lower().strip()
+            if not key or lname in seen:
+                continue
+            targets.append({"provider": lname, "api_key": key, "base_url": None})
+            seen.add(lname)
+
+    endpoints = config.get("custom_endpoints", []) if isinstance(config, dict) else []
+    if isinstance(endpoints, list):
+        for ep in endpoints:
+            if not isinstance(ep, dict):
+                continue
+            name = str(ep.get("name") or ep.get("provider") or "").lower().strip()
+            key = ep.get("api_key")
+            base_url = ep.get("base_url")
+            if not name or not base_url:
+                continue
+            targets.append({"provider": name, "api_key": key or "", "base_url": base_url})
+            seen.add(name)
+
+    return targets
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    """revolver discover — auto-detect providers, fetch models, build/refresh chambers."""
+    config = load_config()
+    targets = gather_discovery_targets(config)
+
+    if not targets and not getattr(args, "provider", None):
+        print("🔍 No configured providers found. Set env vars (e.g. GROQ_API_KEY),")
+        print("   add api_keys/custom_endpoints to ~/.revolver/config.json, or pass --provider.")
+        return 0
+
+    # Explicit --provider/--api-key/--base-url override auto-detection.
+    if getattr(args, "provider", None):
+        targets = [{
+            "provider": args.provider,
+            "api_key": getattr(args, "api_key", None) or get_api_key(args.provider) or "",
+            "base_url": getattr(args, "base_url", None),
+        }]
+
+    rev = build_revolver(budget_config_path=str(BUDGET_FILE))
+    use_cache = not getattr(args, "no_cache", False)
+    force = getattr(args, "force", False)
+
+    print("\n🔍 Revolver — Universal Provider Discovery\n")
+    total_chambers = 0
+    for target in targets:
+        provider = target["provider"]
+        api_key = target["api_key"]
+        base_url = target["base_url"]
+        resolved = detect_provider(api_key=api_key, base_url=base_url, provider_hint=provider)
+        try:
+            names = rev.refresh_provider(
+                provider,
+                api_key,
+                base_url=base_url,
+                use_cache=use_cache,
+                force_refresh=force,
+                tier=getattr(args, "tier", None),
+            )
+        except Exception as exc:
+            print(f"  ❌ {provider}: {exc}")
+            continue
+
+        models = discover_provider_models(
+            provider, api_key, base_url=base_url, use_cache=use_cache, force_refresh=force,
+        )
+        tier_counts = {"sprint": 0, "heavy": 0, "any": 0}
+        for m in models:
+            t = classify_model_tier(m) or "any"
+            tier_counts[t if t in tier_counts else "any"] += 1
+        total_chambers += len(names)
+        proto = resolved["protocol"]
+        endpoint = resolved["base_url"] or "(default)"
+        print(f"  • {provider} [{proto}] @ {endpoint}")
+        print(f"      models discovered: {len(models)}  (sprint={tier_counts['sprint']}, "
+              f"heavy={tier_counts['heavy']}, any={tier_counts['any']})")
+        if models:
+            preview = ", ".join(models[:5])
+            more = " …" if len(models) > 5 else ""
+            print(f"      e.g. {preview}{more}")
+
+    chambers = rev.get_status()
+    active = [c for c in chambers if not c.get("pruned")]
+    print(f"\n✅ Discovery complete. Active chambers: {len(active)} "
+          f"(registered this run: {total_chambers}).")
+    print(f"   Cache: {MODELS_CACHE_PATH}")
+    rev.close()
+    return 0
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    """revolver prune — prune dead models and replace with healthy chambers."""
+    rev = build_revolver(budget_config_path=str(BUDGET_FILE))
+    apply = getattr(args, "apply", False)
+    max_days = getattr(args, "days", DEFAULT_MAX_DOWN_DAYS)
+    force = getattr(args, "force", False)
+
+    mode = "APPLY" if apply else "DRY-RUN"
+    print(f"\n🧹 Revolver — Dead-Model Pruning ({mode})\n")
+    print(f"   Thresholds: max_down_days={max_days}, "
+          f"min_consecutive_failures={DEFAULT_MIN_CONSECUTIVE_FAILURES}, force={force}")
+
+    result = rev.prune_dead_models(
+        max_down_days=max_days,
+        min_consecutive_failures=DEFAULT_MIN_CONSECUTIVE_FAILURES,
+        force=force,
+        apply=apply,
+    )
+
+    events = result.get("events", [])
+    if not events:
+        print("   No dead chambers detected.")
+    else:
+        for ev in events:
+            print(f"   • {ev['name']} [{ev.get('model')}] — {ev['reason']} "
+                  f"(consecutive_failures={ev['consecutive_failures']}, down_days={ev['down_days']})")
+
+    pruned = result.get("pruned", [])
+    if apply and pruned:
+        rep = rev.replace_pruned_with_healthy(
+            use_cache=not getattr(args, "no_cache", False),
+            force_refresh=getattr(args, "force", False),
+            apply=True,
+        )
+        added = rep.get("added", [])
+        if added:
+            print(f"\n   ♻️  Healthy replacements added: {len(added)}")
+            for name in added:
+                print(f"      + {name}")
+        else:
+            print("\n   ♻️  No healthy replacements found (all candidates already registered).")
+    elif not apply and pruned:
+        print(f"\n   (dry-run) {len(pruned)} chamber(s) would be pruned and replaced. "
+              "Re-run with --apply to execute.")
+
+    active = [c for c in rev.get_status() if not c.get("pruned")]
+    print(f"\n   Active chambers after prune: {len(active)}")
+    print(f"   State: {CHAMBERS_STATE_PATH}")
+    rev.close()
     return 0
 
 
@@ -1171,7 +1354,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
     print("\n🤖 Revolver Agent — Interactive Mode")
     print(f"   Workspace: {workspace.root}")
     print("   Commands: /read <repo:path> | /write <repo:path> | /edit <repo:path> | /run <cmd> |")
-    print("             /ls <repo:path> | /repo add <alias> <path> | /repo list | /undo | /quit\n")
+    print("             /ls <repo:path> | /repo add <alias> <path> | /repo list | /undo |")
+    print("             /discover | /prune [--days N] [--force] [--apply] | /swe <task> | /quit\n")
 
     rev = build_revolver(race_mode=args.race_mode)
     tag_chambers_by_tier(rev)
@@ -1328,6 +1512,57 @@ def cmd_agent(args: argparse.Namespace) -> int:
             test_cmds = args.test_cmd.split(",") if args.test_cmd else None
             success = agent.run(task, test_commands=test_cmds)
             print(f"\n{'✅ SWE task completed.' if success else '❌ SWE task did not complete.'}")
+            continue
+
+        if user_input.startswith("/discover") or user_input == "/discover":
+            cfg = load_config()
+            targets = gather_discovery_targets(cfg)
+            if not targets:
+                print("   No configured providers. Set env vars or ~/.revolver/config.json first.")
+                continue
+            print("   (discovering providers...)")
+            for target in targets:
+                try:
+                    rev.refresh_provider(
+                        target["provider"], target["api_key"], base_url=target["base_url"],
+                    )
+                    print(f"   • refreshed '{target['provider']}'")
+                except Exception as exc:
+                    print(f"   ❌ {target['provider']}: {exc}")
+            tag_chambers_by_tier(rev)
+            active = [c for c in rev.get_status() if not c.get("pruned")]
+            print(f"   Active chambers: {len(active)}")
+            continue
+
+        if user_input.startswith("/prune"):
+            parts = user_input.split()
+            apply = "--apply" in parts
+            force = "--force" in parts
+            days = DEFAULT_MAX_DOWN_DAYS
+            if "--days" in parts:
+                try:
+                    days = int(parts[parts.index("--days") + 1])
+                except (IndexError, ValueError):
+                    print("   Usage: /prune [--days N] [--force] [--apply]")
+                    continue
+            mode = "APPLY" if apply else "DRY-RUN"
+            print(f"   (pruning dead models — {mode})")
+            result = rev.prune_dead_models(max_down_days=days, force=force, apply=apply)
+            pruned = result.get("pruned", [])
+            if not pruned:
+                print("   No dead chambers detected.")
+            else:
+                for ev in result.get("events", []):
+                    print(f"   • {ev['name']} — {ev['reason']}")
+                if apply:
+                    rep = rev.replace_pruned_with_healthy(apply=True)
+                    added = rep.get("added", [])
+                    print(f"   ♻️  Healthy replacements added: {len(added)}")
+                    for name in added:
+                        print(f"      + {name}")
+                    tag_chambers_by_tier(rev)
+                else:
+                    print(f"   (dry-run) {len(pruned)} would be pruned. Use /prune --apply to execute.")
             continue
 
         # --- Natural language: use Revolver as the brain ---
@@ -1627,6 +1862,24 @@ def build_parser() -> argparse.ArgumentParser:
     # --- test ---
     p_test = sub.add_parser("test", help="Run the built-in test suite")
     p_test.set_defaults(func=cmd_test)
+
+    # --- discover ---
+    p_discover = sub.add_parser("discover", help="Auto-detect providers, fetch models, build chambers")
+    p_discover.add_argument("--provider", default=None, help="Explicit provider name (overrides auto-detect)")
+    p_discover.add_argument("--api-key", default=None, help="API key for --provider")
+    p_discover.add_argument("--base-url", default=None, help="Custom OpenAI-compatible base_url")
+    p_discover.add_argument("--tier", choices=["sprint", "heavy"], default=None, help="Force a tier for discovered chambers")
+    p_discover.add_argument("--no-cache", action="store_true", help="Bypass the local models cache")
+    p_discover.add_argument("--force", action="store_true", help="Force a fresh discovery (refresh cache)")
+    p_discover.set_defaults(func=cmd_discover)
+
+    # --- prune ---
+    p_prune = sub.add_parser("prune", help="Prune dead models and replace with healthy chambers")
+    p_prune.add_argument("--days", type=int, default=DEFAULT_MAX_DOWN_DAYS, help="Max consecutive down days before pruning")
+    p_prune.add_argument("--force", action="store_true", help="Prune any chamber with an outage regardless of thresholds")
+    p_prune.add_argument("--apply", action="store_true", help="Apply pruning + replacement (default is dry-run)")
+    p_prune.add_argument("--no-cache", action="store_true", help="Bypass the local models cache during replacement")
+    p_prune.set_defaults(func=cmd_prune)
 
     # --- agent ---
     p_agent = sub.add_parser("agent", help="Interactive coding agent (Revolver as brain)")

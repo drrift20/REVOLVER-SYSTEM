@@ -31,9 +31,22 @@ from .revolver import (
     TIER_SPRINT,
     TIER_HEAVY,
     TIER_ANY,
+    detect_provider,
+    discover_provider_models,
+    classify_model_tier,
+    ChamberStateStore,
+    refresh_provider,
+    prune_dead_models,
+    replace_pruned_with_healthy,
+    get_chamber_outage,
+    MODELS_CACHE_PATH,
+    CHAMBERS_STATE_PATH,
+    DEFAULT_MODELS_CACHE_TTL,
+    DEFAULT_MAX_DOWN_DAYS,
+    DEFAULT_MIN_CONSECUTIVE_FAILURES,
 )
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __all__ = [
     "Revolver",
     "AsyncRevolver",
@@ -63,4 +76,17 @@ __all__ = [
     "TIER_SPRINT",
     "TIER_HEAVY",
     "TIER_ANY",
+    "detect_provider",
+    "discover_provider_models",
+    "classify_model_tier",
+    "ChamberStateStore",
+    "refresh_provider",
+    "prune_dead_models",
+    "replace_pruned_with_healthy",
+    "get_chamber_outage",
+    "MODELS_CACHE_PATH",
+    "CHAMBERS_STATE_PATH",
+    "DEFAULT_MODELS_CACHE_TTL",
+    "DEFAULT_MAX_DOWN_DAYS",
+    "DEFAULT_MIN_CONSECUTIVE_FAILURES",
 ]

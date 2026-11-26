@@ -718,5 +718,168 @@ class TestPhase5SchemaAsync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, '{"answer": "ok"}')
 
 
+class TestPhase6UniversalDiscovery(unittest.TestCase):
+    """Universal provider auto-detection, dynamic discovery, pruning & replacement."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        import revolver as R
+
+        self.R = R
+        self.tmp = Path(tempfile.mkdtemp())
+        # Redirect on-disk cache/state to a temp dir so tests never touch ~/.revolver.
+        self._orig_cache = R.MODELS_CACHE_PATH
+        self._orig_state = R.CHAMBERS_STATE_PATH
+        R.MODELS_CACHE_PATH = self.tmp / "models_cache.json"
+        R.CHAMBERS_STATE_PATH = self.tmp / "chambers_state.json"
+        self.state_file = str(self.tmp / "chambers_state.json")
+
+    def tearDown(self):
+        self.R.MODELS_CACHE_PATH = self._orig_cache
+        self.R.CHAMBERS_STATE_PATH = self._orig_state
+
+    def test_detect_provider_key_prefixes(self):
+        d = self.R.detect_provider
+        self.assertEqual(d(api_key="gsk_abc")["provider"], "groq")
+        self.assertEqual(d(api_key="AIzaSyX")["provider"], "gemini")
+        self.assertEqual(d(api_key="sk-or-v1-x")["provider"], "openrouter")
+        self.assertEqual(d(api_key="sk-ant-1")["provider"], "anthropic")
+        self.assertEqual(d(api_key="sk-abc")["provider"], "openai")
+
+    def test_detect_provider_base_url_and_custom(self):
+        d = self.R.detect_provider
+        self.assertEqual(d(base_url="https://api.deepseek.com/v1")["provider"], "deepseek")
+        self.assertEqual(d(base_url="http://localhost:8000/v1")["provider"], "custom")
+        # custom base_url yields a clean openai-compatible adapter
+        res = d(base_url="http://myhost/v1")
+        self.assertEqual(res["protocol"], "openai")
+        self.assertTrue(res["chat_url"].endswith("/v1/chat/completions"))
+        self.assertTrue(res["models_url"].endswith("/v1/models"))
+
+    def test_detect_provider_hint_overrides(self):
+        res = self.R.detect_provider(provider_hint="groq", api_key="sk-whatever")
+        self.assertEqual(res["provider"], "groq")
+        self.assertEqual(res["protocol"], "openai")
+
+    def test_classify_model_tier(self):
+        c = self.R.classify_model_tier
+        self.assertEqual(c("gemini-2.5-flash"), self.R.TIER_SPRINT)
+        self.assertEqual(c("llama-3.3-70b-versatile"), self.R.TIER_HEAVY)
+        self.assertIsNone(c("some-random-model"))
+
+    def test_discover_models_cache_and_filter(self):
+        import requests
+        calls = {"n": 0}
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self):
+                return {"data": [
+                    {"id": "gemini-2.5-flash"},
+                    {"id": "gemini-2.5-pro"},
+                    {"id": "text-embedding-004"},
+                ]}
+
+        orig = requests.get
+        requests.get = lambda url, headers=None, timeout=None: (calls.__setitem__("n", calls["n"] + 1), FakeResp())[1]
+        try:
+            m1 = self.R.discover_provider_models("gemini", "AIzaKey", use_cache=True)
+            m2 = self.R.discover_provider_models("gemini", "AIzaKey", use_cache=True)
+            m3 = self.R.discover_provider_models("gemini", "AIzaKey", use_cache=True, force_refresh=True)
+        finally:
+            requests.get = orig
+
+        self.assertEqual(calls["n"], 2)  # one network + one forced refresh
+        self.assertNotIn("text-embedding-004", m1)
+        self.assertEqual(m1, m2)
+        self.assertEqual(m1, m3)
+
+    def test_refresh_provider_registers_tiers_and_metadata(self):
+        import requests
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self):
+                return {"data": [{"id": "gemini-2.5-flash"}, {"id": "gemini-2.5-pro"}]}
+
+        orig = requests.get
+        requests.get = lambda url, headers=None, timeout=None: FakeResp()
+        rev = self.R.Revolver(persist_state=False)
+        try:
+            names = rev.refresh_provider("gemini", "AIzaKey", use_cache=False)
+            self.assertEqual(len(names), 2)
+            by_model = {c["model"]: c for c in rev.get_status()}
+            self.assertEqual(by_model["gemini-2.5-flash"]["tier"], self.R.TIER_SPRINT)
+            self.assertEqual(by_model["gemini-2.5-pro"]["tier"], self.R.TIER_HEAVY)
+            self.assertEqual(by_model["gemini-2.5-flash"]["provider"], "gemini")
+            self.assertFalse(by_model["gemini-2.5-flash"]["pruned"])
+        finally:
+            requests.get = orig
+            rev.close()
+
+    def test_prune_and_replace_flow(self):
+        import time
+        import requests
+
+        rev = self.R.Revolver(persist_state=True, state_path=self.state_file)
+        rev.add_provider("groq", api_key="gsk_x", models=["llama-3.3-70b-versatile"])
+        name = rev._chambers[0]["name"]
+        store = rev._state_store
+        for i in range(10):
+            store.note_failure(name, now=1000.0 + i)
+        store.record(name)["first_down_at"] = time.time() - 5 * 86400
+        store.save(force=True)
+
+        # Dry-run detects but does not prune.
+        dry = rev.prune_dead_models(apply=False)
+        self.assertIn(name, dry["pruned"])
+        self.assertFalse(rev._chambers[0]["pruned"])
+
+        # Apply prunes and removes from racing.
+        applied = rev.prune_dead_models(apply=True)
+        self.assertIn(name, applied["pruned"])
+        healthy, cooled = rev.rank_chambers()
+        self.assertNotIn(name, [c["name"] for c in healthy + cooled])
+
+        # Replacement pulls a healthy model (filters non-chat).
+        class FakeResp:
+            status_code = 200
+
+            def json(self):
+                return {"data": [
+                    {"id": "llama-3.3-70b-versatile"},
+                    {"id": "openai/gpt-oss-120b"},
+                    {"id": "whisper-large-v3"},
+                ]}
+
+        orig = requests.get
+        requests.get = lambda url, headers=None, timeout=None: FakeResp()
+        try:
+            rep = rev.replace_pruned_with_healthy(use_cache=False, apply=True)
+        finally:
+            requests.get = orig
+        self.assertTrue(any("gpt-oss-120b" in n for n in rep["added"]))
+        self.assertFalse(any("whisper" in n for n in rep["added"]))
+        rev.close()
+
+        # Persistence: a fresh engine sees the pruned flag.
+        rev2 = self.R.Revolver(persist_state=True, state_path=self.state_file)
+        self.assertTrue(rev2._state_store.get(name).get("pruned"))
+        rev2.close()
+
+    def test_new_chamber_defaults_to_free_budget(self):
+        budget_file = str(self.tmp / "budget.json")
+        rev = self.R.Revolver(persist_state=False)
+        rev.set_budget(limit_usd=10.0, config_path=budget_file)
+        rev.add_provider("groq", api_key="gsk_x", models=["llama-3.3-70b-versatile"])
+        name = rev._chambers[0]["name"]
+        # Auto-registered as free (0.0) without blocking usage.
+        self.assertFalse(rev._budget_guard.is_paid(name))
+        rev.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

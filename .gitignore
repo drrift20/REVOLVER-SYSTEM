@@ -43,4 +43,5 @@ ENV/
 
 # Testing & logs
 .pytest_cache/
+.ruff_cache/
 *.log

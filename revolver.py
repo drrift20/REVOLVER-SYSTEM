@@ -32,6 +32,7 @@ import queue
 import threading
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Set, Tuple, Union
 
 import requests
@@ -374,7 +375,472 @@ KNOWN_PROVIDERS = {
             "llama3.1-8b",
         ],
     },
+    "deepseek": {
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "models_url": "https://api.deepseek.com/v1/models",
+        "default_models": [
+            "deepseek-chat",
+            "deepseek-reasoner",
+        ],
+    },
+    "together": {
+        "url": "https://api.together.xyz/v1/chat/completions",
+        "models_url": "https://api.together.xyz/v1/models",
+        "default_models": [
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        ],
+    },
+    "fireworks": {
+        "url": "https://api.fireworks.ai/inference/v1/chat/completions",
+        "models_url": "https://api.fireworks.ai/inference/v1/models",
+        "default_models": [
+            "accounts/fireworks/models/llama-v3p1-70b-instruct",
+        ],
+    },
+    "xai": {
+        "url": "https://api.x.ai/v1/chat/completions",
+        "models_url": "https://api.x.ai/v1/models",
+        "default_models": [
+            "grok-2-latest",
+        ],
+    },
+    "ollama": {
+        "url": "http://localhost:11434/v1/chat/completions",
+        "models_url": "http://localhost:11434/v1/models",
+        "default_models": [],
+    },
+    "anthropic": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "models_url": "https://api.anthropic.com/v1/models",
+        "default_models": [
+            "claude-3-5-sonnet-latest",
+        ],
+        "protocol": "anthropic",
+        "extra_headers": {
+            "anthropic-version": "2023-06-01",
+        },
+    },
 }
+
+
+# ---------------------------------------------------------------------------
+# Universal Provider Auto-Detection, Dynamic Discovery & Dead-Model Pruning
+# ---------------------------------------------------------------------------
+
+# On-device persistence & cache locations (Linux + Windows via Path.home()).
+REVOLVER_HOME = Path.home() / ".revolver"
+MODELS_CACHE_PATH = REVOLVER_HOME / "models_cache.json"
+CHAMBERS_STATE_PATH = REVOLVER_HOME / "chambers_state.json"
+
+# Discovery cache time-to-live (seconds). Keeps startup/routing fast while
+# avoiding rate-limit storms from re-fetching /models on every call.
+DEFAULT_MODELS_CACHE_TTL = 6 * 60 * 60  # 6 hours
+
+# Dead-model pruning defaults. Conservative so a brief 429 or single hiccup
+# never wipes a good model.
+DEFAULT_MAX_DOWN_DAYS = 3
+DEFAULT_MIN_CONSECUTIVE_FAILURES = 8
+DEFAULT_LOW_POOL_THRESHOLD = 1
+
+# API-key prefix -> provider heuristics (checked before base_url inference).
+API_KEY_PREFIX_HINTS: Tuple[Tuple[str, str], ...] = (
+    ("gsk_", "groq"),
+    ("AIza", "gemini"),
+    ("sk-or-", "openrouter"),
+    ("sk-ant-", "anthropic"),
+    ("sk-proj-", "openai"),
+    ("sk-", "openai"),
+)
+
+# base_url domain/path fragments -> provider heuristics.
+BASE_URL_HINTS: Tuple[Tuple[str, str], ...] = (
+    ("api.groq.com", "groq"),
+    ("generativelanguage.googleapis.com", "gemini"),
+    ("openrouter.ai", "openrouter"),
+    ("api.openai.com", "openai"),
+    ("api.anthropic.com", "anthropic"),
+    ("api.deepseek.com", "deepseek"),
+    ("api.together.xyz", "together"),
+    ("api.fireworks.ai", "fireworks"),
+    ("api.x.ai", "xai"),
+    ("api.mistral.ai", "mistral"),
+    ("api.cerebras.ai", "cerebras"),
+    ("localhost:11434", "ollama"),
+    ("127.0.0.1:11434", "ollama"),
+)
+
+# Model-name fragments that are NOT chat/completion models.
+NON_CHAT_MODEL_MARKERS = (
+    "embed", "whisper", "tts", "moderation", "dall-e", "audio",
+    "rerank", "guard", "clip", "vision-encoder",
+)
+
+# Tier classification markers for discovered models.
+SPRINT_MODEL_MARKERS = (
+    "flash", "lite", "mini", "8b", "20b", "small", "fast", "nano", "tiny",
+    "instant", "turbo",
+)
+HEAVY_MODEL_MARKERS = (
+    "pro", "70b", "120b", "opus", "o1", "o3", "large", "max", "reasoner",
+    "405b", "235b", "ultra",
+)
+
+
+def _ensure_revolver_home() -> None:
+    """Best-effort creation of ~/.revolver (never raises)."""
+    try:
+        REVOLVER_HOME.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+
+def _infer_provider_from_key(api_key: Optional[str]) -> Optional[str]:
+    """Infer a provider name from API-key prefix heuristics."""
+    if not api_key:
+        return None
+    for prefix, provider in API_KEY_PREFIX_HINTS:
+        if api_key.startswith(prefix):
+            return provider
+    return None
+
+
+def _infer_provider_from_url(base_url: Optional[str]) -> Optional[str]:
+    """Infer a provider name from a base_url domain/path."""
+    if not base_url:
+        return None
+    lowered = base_url.lower()
+    for fragment, provider in BASE_URL_HINTS:
+        if fragment in lowered:
+            return provider
+    return None
+
+
+def _chat_completions_url(base_url: str) -> str:
+    """Derive a chat-completions endpoint from an arbitrary base_url."""
+    url = base_url.rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url
+    if url.endswith("/v1") or url.endswith("/v1beta") or url.endswith("/openai"):
+        return f"{url}/chat/completions"
+    if url.endswith("/messages"):
+        return url
+    return f"{url}/v1/chat/completions"
+
+
+def _models_url(base_url: str) -> str:
+    """Derive a /models endpoint from an arbitrary base_url."""
+    url = base_url.rstrip("/")
+    if url.endswith("/models"):
+        return url
+    if url.endswith("/chat/completions"):
+        return url[: -len("/chat/completions")] + "/models"
+    if url.endswith("/messages"):
+        return url[: -len("/messages")] + "/models"
+    if url.endswith("/v1") or url.endswith("/v1beta") or url.endswith("/openai"):
+        return f"{url}/models"
+    return f"{url}/v1/models"
+
+
+def detect_provider(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    provider_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Universal provider auto-detection.
+
+    Resolution order:
+      1. Explicit ``provider_hint`` (known name or custom name + base_url).
+      2. ``base_url`` domain/path inference.
+      3. API-key prefix heuristics.
+      4. Clean fallback to an OpenAI-compatible adapter (custom base_url) or the
+         ``openai`` provider when nothing else matches.
+
+    Returns a normalized dict:
+      {
+        "provider": str,            # canonical/known name or custom slug
+        "protocol": str,            # "openai" | "anthropic"
+        "base_url": str,            # origin base url (may be "")
+        "chat_url": str,            # chat-completions endpoint
+        "models_url": str,          # /models endpoint (may be "")
+        "headers":   dict,          # provider extra headers (no auth)
+        "default_models": list,     # fallback model ids
+        "known": bool,              # whether it matched KNOWN_PROVIDERS
+      }
+    """
+    hint = (provider_hint or "").lower().strip()
+
+    provider = None
+    if hint:
+        provider = hint
+    if provider is None:
+        provider = _infer_provider_from_url(base_url)
+    if provider is None:
+        provider = _infer_provider_from_key(api_key)
+    if provider is None:
+        # Fall back cleanly: custom base_url -> generic openai-compatible adapter,
+        # otherwise assume openai.
+        provider = "openai" if not base_url else "custom"
+
+    info = KNOWN_PROVIDERS.get(provider, {})
+    is_known = provider in KNOWN_PROVIDERS
+    protocol = info.get("protocol", "openai")
+
+    if base_url:
+        origin = base_url.rstrip("/")
+        chat_url = _chat_completions_url(base_url)
+        models_u = _models_url(base_url)
+        # Anthropic-style base urls keep the /messages protocol.
+        if origin.endswith("/messages") or provider == "anthropic":
+            protocol = "anthropic"
+    else:
+        origin = info.get("url", "")
+        chat_url = info.get("url", "")
+        models_u = info.get("models_url", "")
+
+    headers = dict(info.get("extra_headers", {}))
+    default_models = list(info.get("default_models", []))
+
+    return {
+        "provider": provider,
+        "protocol": protocol,
+        "base_url": origin,
+        "chat_url": chat_url,
+        "models_url": models_u,
+        "headers": headers,
+        "default_models": default_models,
+        "known": is_known and not base_url,
+    }
+
+
+def classify_model_tier(model_id: str) -> Optional[str]:
+    """
+    Classify a discovered model id into a chamber tier.
+
+    Returns ``TIER_SPRINT`` for fast/cheap models, ``TIER_HEAVY`` for
+    frontier/reasoning models, or ``TIER_ANY`` (None) when ambiguous.
+    """
+    if not model_id:
+        return TIER_ANY
+    lowered = model_id.lower()
+    if any(marker in lowered for marker in HEAVY_MODEL_MARKERS):
+        return TIER_HEAVY
+    if any(marker in lowered for marker in SPRINT_MODEL_MARKERS):
+        return TIER_SPRINT
+    return TIER_ANY
+
+
+def _is_chat_capable_model(model_id: str) -> bool:
+    """Return False for embedding/audio/moderation models that cannot chat."""
+    lowered = model_id.lower()
+    return not any(marker in lowered for marker in NON_CHAT_MODEL_MARKERS)
+
+
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    """Read a JSON object from disk; return {} on any failure."""
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _write_json_file(path: Path, data: Dict[str, Any]) -> None:
+    """Atomically-ish write a JSON object to disk; never raises."""
+    try:
+        _ensure_revolver_home()
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _load_models_cache() -> Dict[str, Any]:
+    """Load the on-disk model-discovery cache (structure: {provider_key: entry})."""
+    return _read_json_file(MODELS_CACHE_PATH)
+
+
+def _save_models_cache(cache: Dict[str, Any]) -> None:
+    _write_json_file(MODELS_CACHE_PATH, cache)
+
+
+def _models_cache_key(provider: str, base_url: Optional[str]) -> str:
+    return f"{provider}::{base_url or ''}"
+
+
+def discover_provider_models(
+    provider_name: str,
+    api_key: str,
+    base_url: Optional[str] = None,
+    use_cache: bool = True,
+    force_refresh: bool = False,
+    max_models: int = 50,
+    cache_ttl: int = DEFAULT_MODELS_CACHE_TTL,
+) -> List[str]:
+    """
+    Discover chat-capable models for a provider with local caching.
+
+    Fetches from the provider's ``/models`` endpoint (or a sensible fallback
+    list when no endpoint is exposed), caches results in
+    ``~/.revolver/models_cache.json`` with a TTL, and returns a filtered list of
+    chat-capable model ids. ``force_refresh`` bypasses the cache; ``use_cache``
+    disables reading/writing the cache entirely.
+    """
+    resolved = detect_provider(api_key=api_key, base_url=base_url, provider_hint=provider_name)
+    models_url = resolved["models_url"]
+    cache_key = _models_cache_key(resolved["provider"], base_url)
+
+    if use_cache and not force_refresh:
+        cache = _load_models_cache()
+        entry = cache.get(cache_key)
+        if isinstance(entry, dict):
+            cached_at = entry.get("cached_at", 0)
+            models = entry.get("models")
+            if isinstance(models, list) and (time.time() - float(cached_at)) < cache_ttl:
+                return models[:max_models]
+
+    discovered: List[str] = []
+    if models_url:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        headers.update(resolved["headers"])
+        try:
+            resp = requests.get(models_url, headers=headers, timeout=8)
+            if resp.status_code == 200:
+                discovered = _filter_discovered_models(resp.json(), max_models=max_models)
+            else:
+                log.info("Model discovery for %s returned HTTP %s", provider_name, resp.status_code)
+        except requests.exceptions.RequestException as exc:
+            log.warning("Model discovery failed on %s: %s", models_url, exc)
+
+    if not discovered:
+        discovered = list(resolved["default_models"])[:max_models]
+
+    if use_cache:
+        cache = _load_models_cache()
+        cache[cache_key] = {"cached_at": time.time(), "models": discovered}
+        _save_models_cache(cache)
+
+    return discovered
+
+
+def _filter_discovered_models(data: Any, max_models: int = 50) -> List[str]:
+    """Extract and filter chat-capable model ids from a /models JSON payload."""
+    if not isinstance(data, dict):
+        return []
+    raw_models = data.get("data") or data.get("models") or []
+    model_ids: List[str] = []
+    for item in raw_models:
+        m_id = item.get("id") or item.get("name") if isinstance(item, dict) else str(item)
+        if m_id:
+            if m_id.startswith("models/"):
+                m_id = m_id.replace("models/", "")
+            model_ids.append(m_id)
+    if not model_ids:
+        return []
+    filtered = [m for m in model_ids if _is_chat_capable_model(m)]
+    return (filtered or model_ids)[:max_models]
+
+
+class ChamberStateStore:
+    """
+    Persistent per-chamber health & outage history (chambers_state.json).
+
+    Tracks ``consecutive_failures``, ``last_ok_at``, ``first_down_at`` and a
+    ``pruned`` flag per chamber/model so dead routes can be pruned across
+    process restarts. Disk writes are throttled and best-effort; loading never
+    auto-prunes live chambers (pruning is always an explicit action).
+    """
+
+    def __init__(self, path: Optional[str] = None, save_interval: float = 3.0):
+        self.path = Path(path) if path else CHAMBERS_STATE_PATH
+        self.save_interval = float(save_interval)
+        self._lock = threading.Lock()
+        self._last_save = 0.0
+        self._dirty = False
+        self.records: Dict[str, Dict[str, Any]] = _read_json_file(self.path)
+
+    def record(self, name: str) -> Dict[str, Any]:
+        """Fetch or create the persistent record for a chamber (caller holds lock)."""
+        rec = self.records.get(name)
+        if rec is None:
+            rec = {
+                "consecutive_failures": 0,
+                "last_ok_at": None,
+                "first_down_at": None,
+                "last_failure_at": None,
+                "pruned": False,
+                "provider": None,
+                "model": None,
+            }
+            self.records[name] = rec
+        return rec
+
+    def note_success(self, name: str, now: Optional[float] = None) -> None:
+        now = now if now is not None else time.time()
+        with self._lock:
+            rec = self.record(name)
+            rec["consecutive_failures"] = 0
+            rec["last_ok_at"] = now
+            rec["first_down_at"] = None
+            rec["pruned"] = False
+            self._dirty = True
+        self._maybe_save()
+
+    def note_failure(self, name: str, now: Optional[float] = None) -> None:
+        now = now if now is not None else time.time()
+        with self._lock:
+            rec = self.record(name)
+            rec["consecutive_failures"] = int(rec.get("consecutive_failures", 0)) + 1
+            rec["last_failure_at"] = now
+            if rec.get("first_down_at") is None:
+                rec["first_down_at"] = now
+            self._dirty = True
+        self._maybe_save()
+
+    def set_metadata(self, name: str, provider: Optional[str], model: Optional[str]) -> None:
+        with self._lock:
+            rec = self.record(name)
+            if provider is not None:
+                rec["provider"] = provider
+            if model is not None:
+                rec["model"] = model
+            self._dirty = True
+
+    def mark_pruned(self, name: str, pruned: bool = True) -> None:
+        with self._lock:
+            self.record(name)["pruned"] = bool(pruned)
+            self._dirty = True
+        self.save(force=True)
+
+    def get(self, name: str) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self.records.get(name, {}))
+
+    def all_records(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return {k: dict(v) for k, v in self.records.items()}
+
+    def _maybe_save(self) -> None:
+        if not self._dirty:
+            return
+        if (time.time() - self._last_save) < self.save_interval:
+            return
+        self.save()
+
+    def save(self, force: bool = False) -> None:
+        with self._lock:
+            if not self._dirty and not force:
+                return
+            snapshot = {k: dict(v) for k, v in self.records.items()}
+            self._dirty = False
+            self._last_save = time.time()
+        _write_json_file(self.path, snapshot)
 
 
 class _BaseRevolver:
@@ -399,6 +865,8 @@ class _BaseRevolver:
         hedge_multiplier: float = HEDGE_LATENCY_MULTIPLIER,
         cost_rates: Optional[Dict[str, Tuple[float, float]]] = None,
         budget_guard: Optional["BudgetGuard"] = None,
+        state_path: Optional[str] = None,
+        persist_state: bool = True,
     ):
         mode = self._validate_race_mode(race_mode)
         self.system_prompt = system_prompt
@@ -418,6 +886,9 @@ class _BaseRevolver:
 
         # Budget guard (on-device paid API spending controls)
         self._budget_guard = budget_guard
+
+        # Persistent per-chamber outage/health history (dead-model pruning).
+        self._state_store = ChamberStateStore(state_path) if persist_state else None
 
         # Thread safety & state storage (in-memory only; never held across I/O)
         self._health_lock = threading.Lock()
@@ -457,6 +928,8 @@ class _BaseRevolver:
         model: str,
         extra_headers: Optional[Dict[str, str]] = None,
         tier: Optional[str] = None,
+        provider: Optional[str] = None,
+        models_url: Optional[str] = None,
     ) -> None:
         """Register a single AI chamber and initialize its health state."""
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -470,15 +943,32 @@ class _BaseRevolver:
             "model": model,
             "headers": headers,
             "tier": tier,
+            "provider": provider,
+            "models_url": models_url,
+            "pruned": False,
         }
 
         with self._health_lock:
             existing_idx = next((i for i, c in enumerate(self._chambers) if c["name"] == name), None)
             if existing_idx is not None:
+                # Preserve pruned status across re-registration of a live name.
+                chamber["pruned"] = self._chambers[existing_idx].get("pruned", False)
                 self._chambers[existing_idx] = chamber
             else:
                 self._chambers.append(chamber)
             self._get_state_locked(name)
+
+        if self._state_store is not None:
+            self._state_store.set_metadata(name, provider, model)
+
+        # Register a safe free (0.0 rate) default with the budget guard so newly
+        # discovered chambers never block free usage; explicit user overrides win.
+        if self._budget_guard is not None:
+            try:
+                if name not in self._budget_guard.config.get("chambers", {}):
+                    self._budget_guard.mark_free(name)
+            except (OSError, ValueError):
+                pass
 
         log.info("Registered chamber: %s (model: %s)", name, model)
 
@@ -538,6 +1028,7 @@ class _BaseRevolver:
         models: List[str],
         provider_label: str,
         tier: Optional[str] = None,
+        models_url: Optional[str] = None,
     ) -> List[str]:
         """Register one chamber per resolved model name and return their chamber names."""
         if not models:
@@ -546,16 +1037,237 @@ class _BaseRevolver:
         created_chambers = []
         for model in models:
             chamber_name = f"{p_name.capitalize()} {model}"
+            # Auto-classify tier per model when no explicit tier override is given.
+            chamber_tier = tier if tier is not None else classify_model_tier(model)
             self.add_chamber(
                 name=chamber_name,
                 url=target_url,
                 api_key=api_key,
                 model=model,
                 extra_headers=headers,
-                tier=tier,
+                tier=chamber_tier,
+                provider=p_name,
+                models_url=models_url,
             )
             created_chambers.append(chamber_name)
         return created_chambers
+
+    # ------------------------------------------------------------------
+    # Universal Discovery, Dead-Model Pruning & Healthy Replacement
+    # ------------------------------------------------------------------
+
+    def refresh_provider(
+        self,
+        provider: str,
+        api_key: str,
+        base_url: Optional[str] = None,
+        use_cache: bool = True,
+        force_refresh: bool = False,
+        max_models: int = 50,
+        tier: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Discover a provider's models (cached) and register/refresh its chambers.
+
+        Returns the list of chamber names now available for the provider.
+        """
+        resolved = detect_provider(api_key=api_key, base_url=base_url, provider_hint=provider)
+        models = discover_provider_models(
+            resolved["provider"],
+            api_key,
+            base_url=base_url,
+            use_cache=use_cache,
+            force_refresh=force_refresh,
+            max_models=max_models,
+        )
+        if not models:
+            models = list(resolved["default_models"])
+        if not models:
+            log.info("No models discovered for provider '%s'", provider)
+            return []
+
+        target_url = resolved["chat_url"] or resolved["base_url"]
+        return self._register_provider_models(
+            resolved["provider"],
+            target_url,
+            api_key,
+            resolved["headers"],
+            models,
+            provider,
+            tier=tier,
+            models_url=resolved["models_url"],
+        )
+
+    def _active_chambers(self) -> List[Dict[str, Any]]:
+        """Return chambers not currently pruned."""
+        return [c for c in self._chambers if not c.get("pruned")]
+
+    def prune_dead_models(
+        self,
+        max_down_days: int = DEFAULT_MAX_DOWN_DAYS,
+        min_consecutive_failures: int = DEFAULT_MIN_CONSECUTIVE_FAILURES,
+        force: bool = False,
+        apply: bool = True,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Identify (and optionally mark) dead models/chambers as pruned.
+
+        A chamber is pruned when it has been down longer than ``max_down_days``
+        OR accumulated ``min_consecutive_failures`` consecutive failures.
+        ``force`` prunes any chamber with any recorded outage regardless of
+        thresholds. When ``apply`` is False this is a dry run.
+
+        Returns a summary dict with ``pruned`` names and per-chamber ``events``.
+        """
+        now = now if now is not None else time.time()
+        events: List[Dict[str, Any]] = []
+        pruned_names: List[str] = []
+
+        for chamber in list(self._chambers):
+            if chamber.get("pruned"):
+                continue
+            name = chamber["name"]
+            rec = self._state_store.get(name) if self._state_store is not None else {}
+            consec = int(rec.get("consecutive_failures", 0) or 0)
+            first_down = rec.get("first_down_at")
+            down_days = ((now - float(first_down)) / 86400.0) if first_down else 0.0
+
+            reason: Optional[str] = None
+            if force:
+                if consec > 0 or first_down is not None:
+                    reason = "forced"
+            else:
+                if first_down is not None and down_days >= max_down_days:
+                    reason = f"down {down_days:.1f}d >= {max_down_days}d"
+                elif consec >= min_consecutive_failures:
+                    reason = f"{consec} consecutive failures >= {min_consecutive_failures}"
+
+            if reason is None:
+                continue
+
+            events.append({
+                "name": name,
+                "model": chamber.get("model"),
+                "provider": chamber.get("provider"),
+                "reason": reason,
+                "consecutive_failures": consec,
+                "down_days": round(down_days, 3),
+            })
+            pruned_names.append(name)
+
+            if apply:
+                chamber["pruned"] = True
+                if self._state_store is not None:
+                    self._state_store.mark_pruned(name, True)
+                with self._health_lock:
+                    st = self._get_state_locked(name)
+                    st["health"] = 0.0
+                    st["cooldown_until"] = now + 10 ** 9
+
+        if apply and pruned_names:
+            log.info("Pruned %d dead chamber(s): %s", len(pruned_names), pruned_names)
+        else:
+            log.info("prune_dead_models dry-run/scan: %d candidate(s)", len(pruned_names))
+
+        return {"pruned": pruned_names, "events": events, "applied": apply}
+
+    def replace_pruned_with_healthy(
+        self,
+        use_cache: bool = True,
+        force_refresh: bool = False,
+        max_models: int = 50,
+        low_pool_threshold: int = DEFAULT_LOW_POOL_THRESHOLD,
+        apply: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Pull verified replacement models into chambers that were pruned or when the
+        active pool drops low.
+
+        Queries cached/fresh provider model discovery for each affected provider
+        and registers healthy, non-duplicate models. Every discovery/prune/
+        replacement event is logged. When ``apply`` is False this is a dry run.
+        """
+        events: List[Dict[str, Any]] = []
+        added_names: List[str] = []
+
+        pruned = [c for c in self._chambers if c.get("pruned")]
+        active = self._active_chambers()
+
+        # Providers to refresh: those with pruned chambers, plus (when the active
+        # pool is low) every provider already represented in the roster.
+        providers: Dict[str, Dict[str, Any]] = {}
+        for c in pruned:
+            p = c.get("provider")
+            if p and p not in providers:
+                providers[p] = c
+        if len(active) <= low_pool_threshold:
+            for c in self._chambers:
+                p = c.get("provider")
+                if p and p not in providers:
+                    providers[p] = c
+
+        existing_models = {c.get("model") for c in self._chambers}
+
+        for provider, sample in providers.items():
+            api_key = sample.get("key")
+            if not api_key:
+                continue
+            base_url = sample.get("models_url") or sample.get("url")
+            try:
+                models = discover_provider_models(
+                    provider,
+                    api_key,
+                    base_url=base_url,
+                    use_cache=use_cache,
+                    force_refresh=force_refresh,
+                    max_models=max_models,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("Replacement discovery failed for '%s': %s", provider, exc)
+                continue
+
+            if not models:
+                events.append({"provider": provider, "action": "no_models", "added": []})
+                continue
+
+            added_here: List[str] = []
+            for model in models:
+                if model in existing_models:
+                    continue
+                chamber_name = f"{provider.capitalize()} {model}"
+                if any(c["name"] == chamber_name for c in self._chambers):
+                    continue
+                extra_headers = {
+                    k: v for k, v in (sample.get("headers") or {}).items()
+                    if k.lower() != "authorization"
+                }
+                if apply:
+                    self.add_chamber(
+                        name=chamber_name,
+                        url=sample.get("url"),
+                        api_key=api_key,
+                        model=model,
+                        extra_headers=extra_headers,
+                        tier=classify_model_tier(model),
+                        provider=provider,
+                        models_url=sample.get("models_url"),
+                    )
+                existing_models.add(model)
+                added_here.append(chamber_name)
+                added_names.append(chamber_name)
+
+            if added_here:
+                log.info("Healthy replacement for '%s': +%s", provider, added_here)
+            events.append({"provider": provider, "action": "replaced", "added": added_here})
+
+        return {"added": added_names, "events": events, "applied": apply}
+
+    def get_chamber_outage(self, name: str) -> Dict[str, Any]:
+        """Return the persistent outage record for a chamber (empty if unknown)."""
+        if self._state_store is None:
+            return {}
+        return self._state_store.get(name)
 
     # ------------------------------------------------------------------
     # Health Scoring, Latency EWMA & Chamber Ranking
@@ -638,6 +1350,13 @@ class _BaseRevolver:
                 state["failures"] += 1
             state["last_update"] = now
 
+        # Persistent outage history for dead-model pruning (outside health lock).
+        if self._state_store is not None:
+            if kind == "ok":
+                self._state_store.note_success(name, now)
+            else:
+                self._state_store.note_failure(name, now)
+
     def get_hedge_delay(
         self,
         primary_chamber: Dict[str, Any],
@@ -672,6 +1391,8 @@ class _BaseRevolver:
         cooled = []
         with self._health_lock:
             for chamber in self._chambers:
+                if chamber.get("pruned"):
+                    continue
                 state = self._get_state_locked(chamber["name"])
                 self._decay_locked(state, now)
                 entry = (state["health"], state["last_used"], chamber)
@@ -1067,14 +1788,28 @@ class _BaseRevolver:
                 is_cooldown = state["cooldown_until"] > now
                 avg_lat = state["avg_latency"]
                 last_lat = state["last_latency"]
+                pruned = bool(chamber.get("pruned"))
+                outage = self._state_store.get(name) if self._state_store is not None else {}
+                if pruned:
+                    status = "pruned"
+                elif is_cooldown:
+                    status = "cooling"
+                else:
+                    status = "healthy"
                 results.append({
                     "name": name,
                     "model": chamber["model"],
+                    "provider": chamber.get("provider"),
+                    "tier": chamber.get("tier"),
+                    "pruned": pruned,
                     "health": round(state["health"], 1),
-                    "status": "cooling" if is_cooldown else "healthy",
+                    "status": status,
                     "cooldown_remaining": max(0.0, round(state["cooldown_until"] - now, 1)),
                     "successes": state["successes"],
                     "failures": state["failures"],
+                    "consecutive_failures": int(outage.get("consecutive_failures", 0) or 0),
+                    "first_down_at": outage.get("first_down_at"),
+                    "last_ok_at": outage.get("last_ok_at"),
                     "avg_latency_ms": round(avg_lat * 1000.0, 1) if avg_lat is not None else None,
                     "last_latency_ms": round(last_lat * 1000.0, 1) if last_lat is not None else None,
                     "prompt_tokens": state["prompt_tokens"],
@@ -1244,6 +1979,8 @@ class Revolver(_BaseRevolver):
         hedge_multiplier: float = HEDGE_LATENCY_MULTIPLIER,
         cost_rates: Optional[Dict[str, Tuple[float, float]]] = None,
         budget_guard: Optional["BudgetGuard"] = None,
+        state_path: Optional[str] = None,
+        persist_state: bool = True,
     ):
         super().__init__(
             system_prompt=system_prompt,
@@ -1258,6 +1995,8 @@ class Revolver(_BaseRevolver):
             hedge_multiplier=hedge_multiplier,
             cost_rates=cost_rates,
             budget_guard=budget_guard,
+            state_path=state_path,
+            persist_state=persist_state,
         )
         self._session = requests.Session()
         adapter = HTTPAdapter(pool_connections=4, pool_maxsize=session_pool_size)
@@ -1316,7 +2055,8 @@ class Revolver(_BaseRevolver):
             target_models = default_models
 
         return self._register_provider_models(
-            p_name, target_url, api_key, headers, target_models, provider, tier=tier
+            p_name, target_url, api_key, headers, target_models, provider, tier=tier,
+            models_url=m_url,
         )
 
     def _call_chamber(
@@ -1796,6 +2536,12 @@ class Revolver(_BaseRevolver):
             self._session.close()
         except Exception as e:
             log.warning("Error during Revolver close: %s", e)
+        finally:
+            if self._state_store is not None:
+                try:
+                    self._state_store.save(force=True)
+                except Exception:
+                    pass
 
 
 # ===========================================================================
@@ -1826,6 +2572,8 @@ class AsyncRevolver(_BaseRevolver):
         hedge_multiplier: float = HEDGE_LATENCY_MULTIPLIER,
         cost_rates: Optional[Dict[str, Tuple[float, float]]] = None,
         budget_guard: Optional["BudgetGuard"] = None,
+        state_path: Optional[str] = None,
+        persist_state: bool = True,
     ):
         if httpx is None:
             raise ImportError("AsyncRevolver requires 'httpx'. Install it with: pip install httpx")
@@ -1843,6 +2591,8 @@ class AsyncRevolver(_BaseRevolver):
             hedge_multiplier=hedge_multiplier,
             cost_rates=cost_rates,
             budget_guard=budget_guard,
+            state_path=state_path,
+            persist_state=persist_state,
         )
         self._async_limits = httpx.Limits(
             max_keepalive_connections=max_keepalive_connections,
@@ -1886,12 +2636,13 @@ class AsyncRevolver(_BaseRevolver):
         tier: Optional[str] = None,
     ) -> List[str]:
         """Register a provider synchronously using `models` or known defaults."""
-        p_name, target_url, _, headers, default_models = self._resolve_provider_config(
+        p_name, target_url, m_url, headers, default_models = self._resolve_provider_config(
             provider, url, models_url, extra_headers
         )
         target_models = list(models) if models else default_models
         return self._register_provider_models(
-            p_name, target_url, api_key, headers, target_models, provider, tier=tier
+            p_name, target_url, api_key, headers, target_models, provider, tier=tier,
+            models_url=m_url,
         )
 
     async def adiscover_models(self, models_url: str, api_key: str) -> List[str]:
@@ -1938,7 +2689,8 @@ class AsyncRevolver(_BaseRevolver):
             target_models = default_models
 
         return self._register_provider_models(
-            p_name, target_url, api_key, headers, target_models, provider, tier=tier
+            p_name, target_url, api_key, headers, target_models, provider, tier=tier,
+            models_url=m_url,
         )
 
     async def _acall_chamber(
@@ -2444,6 +3196,11 @@ class AsyncRevolver(_BaseRevolver):
             finally:
                 self._client = None
                 self._client_loop = None
+        if self._state_store is not None:
+            try:
+                self._state_store.save(force=True)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -2490,3 +3247,21 @@ def mark_chamber_free(name: str) -> None:
 
 def get_budget_status() -> Dict[str, Any]:
     return default_revolver.get_budget_status()
+
+
+# --- Universal provider auto-detection & dynamic discovery (Phase 6) -------
+
+def refresh_provider(*args, **kwargs):
+    return default_revolver.refresh_provider(*args, **kwargs)
+
+
+def prune_dead_models(*args, **kwargs):
+    return default_revolver.prune_dead_models(*args, **kwargs)
+
+
+def replace_pruned_with_healthy(*args, **kwargs):
+    return default_revolver.replace_pruned_with_healthy(*args, **kwargs)
+
+
+def get_chamber_outage(name: str) -> Dict[str, Any]:
+    return default_revolver.get_chamber_outage(name)

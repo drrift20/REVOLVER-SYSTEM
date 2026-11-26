@@ -191,6 +191,64 @@ print(get_budget_status())
 
 ---
 
+## 🌐 Universal Providers, Dynamic Discovery & Self-Healing Chambers (Phase 6)
+
+Revolver now auto-detects **any** provider (OpenAI-compatible endpoints, custom
+`base_url`, or standard providers) and keeps its chamber fleet healthy on its own.
+
+### Universal provider auto-detection
+
+```python
+from revolver import detect_provider, discover_provider_models
+
+detect_provider(api_key="gsk_...")                 # -> groq
+detect_provider(base_url="https://api.deepseek.com/v1")  # -> deepseek
+detect_provider(base_url="http://localhost:8000/v1")     # -> custom (OpenAI-compatible)
+detect_provider(provider_hint="openrouter", api_key="sk-or-...")
+```
+
+Detection uses an explicit hint, then `base_url` domain/path, then API-key prefix
+(`gsk_`→groq, `AIza`→gemini, `sk-or-`→openrouter, `sk-ant-`→anthropic, `sk-`→openai),
+falling back cleanly to an OpenAI-compatible adapter. No heavy dependencies added.
+
+### Dynamic model discovery (cached)
+
+```python
+models = discover_provider_models("groq", api_key, use_cache=True)  # ~/.revolver/models_cache.json
+rev.refresh_provider("groq", api_key)   # discover + register chambers with sprint/heavy tiers
+```
+
+Models are fetched from the provider's `/models` endpoint (or a sensible fallback
+list), cached with a TTL, filtered to chat-capable models, and classified into
+`TIER_SPRINT` / `TIER_HEAVY` chambers. New chambers are registered with the
+`BudgetGuard` as free (0.0 rates) unless you've set explicit overrides.
+
+### Dead-model pruning & healthy replacement
+
+Per-chamber outage history (`consecutive_failures`, `last_ok_at`, `first_down_at`)
+persists in `~/.revolver/chambers_state.json`.
+
+```python
+rev.prune_dead_models(max_down_days=3, min_consecutive_failures=8, apply=True)
+rev.replace_pruned_with_healthy(apply=True)   # pull verified healthy models into the roster
+```
+
+Pruned chambers are removed from racing/hedging; replacements are pulled from
+cached/fresh discovery. Conservative defaults mean a brief 429 never wipes a good model.
+
+### CLI
+
+```bash
+revolver discover            # auto-detect keys/endpoints, fetch models, build/refresh chambers
+revolver discover --provider deepseek --api-key ... --base-url ...
+revolver prune               # dry-run dead-model pruning + replacement
+revolver prune --days 5 --apply
+```
+
+Inside `revolver agent`, use `/discover` and `/prune [--days N] [--force] [--apply]`.
+
+---
+
 ## 🧪 Running Tests & Demo
 
 ```bash
