@@ -21,11 +21,26 @@
 
 ## 📦 Installation & Setup
 
-Install dependencies:
+Install via `pip`:
 
 ```bash
-pip install -r requirements.txt
+# Core install (runtime: requests + httpx)
+pip install .
+
+# For local development with editable mode:
+pip install -e .
+
+# Optional extra: Pydantic for Phase 5 JSON Schema Judge & typed SWE actions:
+pip install ".[pydantic]"
+
+# Optional extra: full test suite runner (pytest, pytest-asyncio, pydantic):
+pip install ".[test]"
+
+# All optional extras:
+pip install ".[all]"
 ```
+
+> **Dependency Policy**: Core runtime requires only `requests>=2.28.0` and `httpx>=0.25.0`. `pydantic>=2.0` is an optional extra: the library and CLI operate cleanly without it, and offline tests gracefully skip Phase 5 schema tests if Pydantic is absent.
 
 ### Synchronous Usage (`Revolver`)
 
@@ -270,11 +285,28 @@ Inside `revolver agent`, interact with the built-in command palette:
 
 ---
 
-## 🧪 Running Tests & Demo
+## 🔒 Security & Operational Boundaries
+
+- **Local Secrets Isolation**: API keys are passed directly in HTTP Authorization headers and stored locally in memory or `~/.revolver/config.json`. They are never logged, exported to Prometheus telemetry, written to model discovery caches, or included in `get_status()`.
+- **Path Traversal Protection**: Workspace handles strictly reject absolute paths and path traversal sequences (`..`) that escape the designated workspace boundary. Deleting the repository root is explicitly prevented.
+- **Confirmation Safeguards vs Sandbox Limits**: Interactive mode prompts for confirmation before destructive modifications and shell commands. In autonomous mode (`--auto`), read-only commands and verified edits run without interactive prompts, but **`git push` always requires mandatory user confirmation**.
+- **Important**: Confirmation prompts and path checks are operational safeguards designed to prevent accidental edits; they do **not** constitute an operating-system sandbox or hypervisor isolation boundary. Shell commands run with the permissions of the host process user.
+
+---
+
+## 🧪 Running Tests & CI
+
+Tests are fully deterministic and run offline without requiring provider API keys or paid network calls.
 
 ```bash
-python3 demo.py
+# Recommended test runner (with pytest):
+pytest -v
+
+# Or Python built-in unittest:
 python3 -m unittest test_revolver.py -v
+
+# Or through the Revolver CLI:
+revolver test
 ```
 
 ---

@@ -19,7 +19,21 @@ import time
 import unittest
 from unittest.mock import MagicMock
 
-from pydantic import BaseModel
+try:
+    from pydantic import BaseModel
+    HAS_PYDANTIC = True
+
+    class _BaseReply(BaseModel):
+        answer: str
+        score: int
+
+    class _BaseAsyncReply(BaseModel):
+        answer: str
+except ImportError:
+    BaseModel = None
+    HAS_PYDANTIC = False
+    _BaseReply = object  # type: ignore[misc, assignment]
+    _BaseAsyncReply = object  # type: ignore[misc, assignment]
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -462,8 +476,9 @@ _SSE_DONE = "data: [DONE]"
 
 
 class _TimedSseResponse:
-    def __init__(self, items):
+    def __init__(self, items, status_code: int = 200):
         self._items = items
+        self.status_code = status_code
         self.closed = False
 
     def iter_lines(self, decode_unicode=True):
@@ -589,8 +604,9 @@ class TestPhase3StreamingAsync(unittest.IsolatedAsyncioTestCase):
 
 
 class _AsyncSseCM:
-    def __init__(self, items):
+    def __init__(self, items, status_code: int = 200):
         self._items = items
+        self.status_code = status_code
 
     async def __aenter__(self):
         return self
@@ -605,10 +621,9 @@ class _AsyncSseCM:
             yield line
 
 
+@unittest.skipUnless(HAS_PYDANTIC, "pydantic is required for Phase 5 schema tests")
 class TestPhase5Schema(unittest.TestCase):
-    class Reply(BaseModel):
-        answer: str
-        score: int
+    Reply = _BaseReply
 
     def setUp(self):
         self.rev = Revolver()
@@ -687,9 +702,9 @@ class TestPhase5Schema(unittest.TestCase):
         self.assertIn('revolver_chamber_cost_usd_total{', out)
 
 
+@unittest.skipUnless(HAS_PYDANTIC, "pydantic is required for Phase 5 schema tests")
 class TestPhase5SchemaAsync(unittest.IsolatedAsyncioTestCase):
-    class Reply(BaseModel):
-        answer: str
+    Reply = _BaseAsyncReply
 
     async def asyncSetUp(self):
         self.rev = AsyncRevolver()
@@ -1001,6 +1016,173 @@ class TestSWEAgentAndCLI(unittest.TestCase):
             self.assertIn("echo answer", f.getvalue())
         finally:
             self.CLI.build_revolver = orig_build
+
+
+class TestCorrectnessAndSafetyRegressions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="revolver_regress_test_"))
+        import revolver
+        import revolver_cli
+        self.R = revolver
+        self.CLI = revolver_cli
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_budget_save_creates_parent_directories(self):
+        """BudgetGuard must create missing parent directories on save."""
+        deep_path = self.tmp / "nested" / "deeply" / "budget.json"
+        bg = self.R.BudgetGuard(config_path=str(deep_path), auto_load=False)
+        bg.set_budget(limit_usd=25.0)
+        self.assertTrue(deep_path.exists())
+        loaded = json.loads(deep_path.read_text(encoding="utf-8"))
+        self.assertEqual(loaded["limit_usd"], 25.0)
+
+    def test_budget_ignore_once_one_hour_window(self):
+        """ignore_once() stays active for up to an hour and does not expire on first check."""
+        from datetime import datetime, timedelta
+        bg = self.R.BudgetGuard(config_path=str(self.tmp / "b.json"), auto_load=False)
+        bg.set_budget(limit_usd=5.0)
+        bg.record_spend(10.0)
+
+        # Before ignore: check raises
+        with self.assertRaises(self.R.BudgetExceeded):
+            bg.check()
+
+        # After ignore_once: check passes
+        bg.ignore_once()
+        bg.check()  # first pass
+        bg.check()  # second pass - still within the hour!
+
+        # Manually set ignore_until to the past
+        bg.config["ignore_until"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        with self.assertRaises(self.R.BudgetExceeded):
+            bg.check()
+        self.assertIsNone(bg.config["ignore_until"])
+
+    def test_budget_record_spend_from_chamber_rates(self):
+        """When cost_rates is unset, spend is recorded using rates registered via mark_chamber_paid."""
+        rev = self.R.Revolver(persist_state=False)
+        budget_path = str(self.tmp / "budget.json")
+        rev.set_budget(limit_usd=50.0, config_path=budget_path)
+        rev.add_chamber("C1", "https://example.com/c1", "k1", "m1")
+        rev.mark_chamber_paid("C1", rate_prompt=1.0, rate_completion=2.0)
+
+        c1 = rev._chambers[0]
+        # Simulate outcome with 2000 prompt tokens ($2.00) and 1000 completion tokens ($2.00) = $4.00
+        rev._apply_outcome(c1, ("ok", 0.1, {"prompt_tokens": 2000, "completion_tokens": 1000}))
+
+        st = rev.get_status()
+        self.assertEqual(st[0]["cost_usd"], 4.0)
+        self.assertEqual(rev.get_metrics()["total_cost_usd"], 4.0)
+        b_st = rev.get_budget_status()
+        self.assertEqual(b_st["spent_usd"], 4.0)
+        rev.close()
+
+    def test_streaming_respects_budget_cap_sync(self):
+        """Streaming mode filters out paid chambers when budget cap is exhausted."""
+        rev = self.R.Revolver(persist_state=False)
+        budget_path = str(self.tmp / "budget.json")
+        rev.set_budget(limit_usd=1.0, config_path=budget_path)
+        rev._budget_guard.record_spend(2.0)  # exhausted
+
+        rev.add_chamber("PaidC1", "https://example.com/paid", "k1", "m1")
+        rev.mark_chamber_paid("PaidC1", rate_prompt=1.0, rate_completion=1.0)
+        rev.add_chamber("FreeC2", "https://example.com/free", "k2", "m2")
+        rev.mark_chamber_free("FreeC2")
+
+        called_urls = []
+        def fake_post(url, headers=None, json=None, stream=None, timeout=None):
+            called_urls.append(url)
+            return _TimedSseResponse([(0.01, _sse("FreeReply")), (0, _SSE_DONE)])
+
+        rev._session.post = fake_post
+        chunks = list(rev.ask("Hello", stream=True))
+        self.assertEqual(chunks, ["FreeReply"])
+        self.assertEqual(called_urls, ["https://example.com/free"])
+        rev.close()
+
+    def test_streaming_exhausted_no_free_chambers_yields_busy(self):
+        """When budget is exhausted and no free chambers exist, streaming yields busy message."""
+        rev = self.R.Revolver(persist_state=False)
+        budget_path = str(self.tmp / "budget.json")
+        rev.set_budget(limit_usd=1.0, config_path=budget_path)
+        rev._budget_guard.record_spend(2.0)
+
+        rev.add_chamber("PaidC1", "https://example.com/paid", "k1", "m1")
+        rev.mark_chamber_paid("PaidC1", rate_prompt=1.0, rate_completion=1.0)
+
+        chunks = list(rev.ask("Hello", stream=True))
+        self.assertTrue(any("budget exhausted" in c for c in chunks))
+        rev.close()
+
+    def test_streaming_non_200_status_handled_as_error(self):
+        """When a streaming response returns non-200 HTTP status, it is treated as an error."""
+        rev = self.R.Revolver(persist_state=False)
+        rev.add_chamber("C1", "https://example.com/c1", "k1", "m1")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        mock_resp.iter_lines.return_value = ["rate limit"]
+        rev._session.post = lambda *args, **kwargs: mock_resp
+
+        chunks = list(rev.ask("Hello", stream=True))
+        # Should yield BUSY_MESSAGE rather than crashing or yielding blank tokens
+        self.assertTrue(any(self.R.BUSY_MESSAGE in c for c in chunks))
+        rev.close()
+
+    def test_repo_handle_path_traversal_protection(self):
+        """RepoHandle.resolve must reject absolute paths and paths escaping workspace root."""
+        ws = self.CLI.MultiRepoWorkspace(self.tmp)
+        repo = ws.primary
+
+        # Absolute paths rejected
+        with self.assertRaises(ValueError) as ctx:
+            repo.resolve("/etc/passwd" if not os.name == "nt" else "C:\\Windows\\win.ini")
+        self.assertIn("Absolute paths are not allowed", str(ctx.exception))
+
+        # Traversal out of root rejected
+        with self.assertRaises(ValueError) as ctx:
+            repo.resolve("../../outside.txt")
+        self.assertIn("escapes workspace", str(ctx.exception))
+
+    def test_repo_handle_refuses_delete_root(self):
+        """RepoHandle.delete_file must reject deleting the repository root."""
+        ws = self.CLI.MultiRepoWorkspace(self.tmp)
+        repo = ws.primary
+        with self.assertRaises(ValueError) as ctx:
+            repo.delete_file(".", confirm=False)
+        self.assertIn("Cannot delete repository root", str(ctx.exception))
+
+    def test_revolver_system_module_import(self):
+        """import revolver_system must re-export core public APIs identically to import revolver."""
+        import revolver_system
+        self.assertTrue(hasattr(revolver_system, "Revolver"))
+        self.assertTrue(hasattr(revolver_system, "AsyncRevolver"))
+        self.assertTrue(hasattr(revolver_system, "BudgetGuard"))
+        self.assertEqual(revolver_system.__version__, "1.4.1")
+
+    def test_swe_agent_git_push_requires_confirm_even_in_auto(self):
+        """In SWEAgent with auto=True, git push commands must STILL require confirmation."""
+        ws = self.CLI.MultiRepoWorkspace(self.tmp)
+        rev = self.R.Revolver(persist_state=False)
+        agent = self.CLI.SWEAgent(ws, rev, auto=True)
+
+        confirm_passed = []
+        def mock_run_command(cmd, confirm=False):
+            confirm_passed.append(confirm)
+            return 0, "ok", ""
+        ws.primary.run_command = mock_run_command
+
+        # Safe command in auto mode: confirm is False
+        action_safe = self.CLI.AgentAction(tool="run_command", args={"command": "npm test"}, reasoning="test")
+        agent._execute_action(action_safe)
+        self.assertEqual(confirm_passed[-1], False)
+
+        # git push in auto mode: confirm MUST BE True
+        action_push = self.CLI.AgentAction(tool="run_command", args={"command": "git push origin main"}, reasoning="push")
+        agent._execute_action(action_push)
+        self.assertEqual(confirm_passed[-1], True)
 
 
 if __name__ == "__main__":

@@ -739,8 +739,14 @@ class RepoHandle:
         self.indexed_at: Optional[float] = None
 
     def resolve(self, rel_path: str) -> Path:
+        # Reject absolute paths upfront to prevent escaping the workspace root
+        if os.path.isabs(rel_path):
+            raise ValueError(f"Absolute paths are not allowed: {rel_path}")
         p = (self.root / rel_path).resolve()
-        if self.root not in p.parents and p != self.root:
+        # Verify the resolved path is under (or equal to) the workspace root
+        try:
+            p.relative_to(self.root)
+        except ValueError:
             raise ValueError(f"Path escapes workspace: {rel_path}")
         return p
 
@@ -799,6 +805,8 @@ class RepoHandle:
 
     def delete_file(self, rel_path: str, confirm: bool = True) -> bool:
         target = self.resolve(rel_path)
+        if target == self.root:
+            raise ValueError(f"Cannot delete repository root: {rel_path}")
         if not target.exists():
             print(f"❌ Not found: {target}")
             return False
@@ -814,7 +822,15 @@ class RepoHandle:
         return True
 
     def run_command(self, command: str, confirm: bool = True, cwd_override: Optional[Path] = None) -> Tuple[int, str, str]:
-        """Run a shell command inside this repo's root by default."""
+        """Run a shell command inside this repo's root by default.
+
+        Security Note:
+            Commands run in the local shell environment with user permissions.
+            User confirmation (and mandatory confirmation for git push) provides
+            operational control, but does not constitute an isolated OS sandbox.
+        """
+        if not command or not command.strip():
+            return -1, "", "Empty command"
         is_git_push = "git push" in command
         if confirm or is_git_push:
             extra = " (git push)" if is_git_push else ""
@@ -1173,14 +1189,18 @@ class SWEAgent:
         """
         Execute a single agent action. Returns (success, output, new_context_hint).
         """
-        if HAS_PYDANTIC and isinstance(action, AgentAction):
+        if isinstance(action, AgentAction):
             tool = action.tool
             args = action.args
             reasoning = action.reasoning
-        else:
+        elif isinstance(action, dict):
             tool = action.get("tool", "")
             args = action.get("args", {})
             reasoning = action.get("reasoning", "")
+        else:
+            tool = getattr(action, "tool", "")
+            args = getattr(action, "args", {})
+            reasoning = getattr(action, "reasoning", "")
 
         print(f"\n🔧 [Step {self.step}] {tool}")
         print(f"   Reasoning: {reasoning[:150]}")
@@ -1242,9 +1262,15 @@ class SWEAgent:
             if tool == "run_command":
                 repo = self.workspace.get_repo(repo_alias)
                 command = args["command"]
-                confirm = args.get("confirm", not self.auto)
-                # git push always needs explicit confirmation.
-                if "git push" in command:
+                # In auto mode, the LLM may request confirm=false for read-only commands.
+                # However, git push always requires explicit user confirmation regardless
+                # of --auto or the LLM's requested confirm value.
+                is_git_push = "git push" in command
+                if is_git_push:
+                    confirm = True
+                elif self.auto:
+                    confirm = False
+                else:
                     confirm = True
                 code, out, err = repo.run_command(command, confirm=confirm)
                 output = f"exit_code={code}\nSTDOUT:\n{out}\nSTDERR:\n{err}"
@@ -1374,7 +1400,7 @@ class SWEAgent:
             success, output, hint = self._execute_action(action)
             action_tool = (
                 action.tool
-                if (HAS_PYDANTIC and isinstance(action, AgentAction))
+                if isinstance(action, AgentAction)
                 else (action.get("tool", "") if isinstance(action, dict) else getattr(action, "tool", ""))
             )
             self.history.append({
@@ -1389,7 +1415,7 @@ class SWEAgent:
                 # Run verification.
                 repo_alias = (
                     action.args.get("repo", "primary")
-                    if (HAS_PYDANTIC and isinstance(action, AgentAction))
+                    if isinstance(action, AgentAction)
                     else (action.get("args", {}).get("repo", "primary") if isinstance(action, dict) else getattr(action, "args", {}).get("repo", "primary"))
                 )
                 ok, verify_out = self._verify(repo_alias, test_commands)
@@ -1409,7 +1435,7 @@ class SWEAgent:
             if action_tool in ("write_file", "edit_file", "delete_file"):
                 repo_alias = (
                     action.args.get("repo", "primary")
-                    if (HAS_PYDANTIC and isinstance(action, AgentAction))
+                    if isinstance(action, AgentAction)
                     else (action.get("args", {}).get("repo", "primary") if isinstance(action, dict) else getattr(action, "args", {}).get("repo", "primary"))
                 )
                 ok, verify_out = self._verify(repo_alias, test_commands)
@@ -1438,7 +1464,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
     workspace = MultiRepoWorkspace(workspace_root)
 
     print("\n🤖 Revolver Agent — Interactive Mode")
-    print(f"   Workspace: {workspace.root}")
+    print(f"   Workspace: {workspace.primary.root}")
     print("   Commands: /help | /status | /budget | /clear | /diff | /swe <task> | /run <cmd> |")
     print("             /ls <path> | /read <path> | /write <path> | /edit <path> | /undo | /quit\n")
 
@@ -1758,7 +1784,7 @@ def cmd_swe(args: argparse.Namespace) -> int:
 
     print(f"\n🚀 Revolver SWE Agent — Autonomous Mode")
     print(f"   Task: {args.task}")
-    print(f"   Workspace: {workspace.root}")
+    print(f"   Workspace: {workspace.primary.root}")
     print(f"   Max steps: {args.max_steps} | Auto: {args.auto}")
     if args.repo:
         print(f"   Repos: {', '.join(workspace.repos.keys())}")

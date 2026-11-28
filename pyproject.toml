@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "revolver-system"
+version = "1.4.1"
+description = "Self-Healing, Staggered-Hedged, Sync & Async Judge Revolver Engine for LLMs"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "drrift20"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+keywords = ["llm", "ai", "orchestration", "hedged-racing", "fault-tolerance"]
+
+dependencies = [
+    "requests>=2.28.0",
+    "httpx>=0.25.0",
+]
+
+[project.optional-dependencies]
+pydantic = ["pydantic>=2.0"]
+test = [
+    "pydantic>=2.0",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+all = [
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+revolver = "revolver_cli:main"
+
+[project.urls]
+Homepage = "https://github.com/drrift20/REVOLVER-SYSTEM"
+Repository = "https://github.com/drrift20/REVOLVER-SYSTEM"
+
+[tool.setuptools]
+py-modules = ["revolver", "revolver_cli", "revolver_system"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_revolver.py"]

@@ -52,6 +52,51 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger("revolver")
 
+__version__ = "1.4.1"
+__all__ = [
+    "Revolver",
+    "AsyncRevolver",
+    "BudgetGuard",
+    "BudgetExceeded",
+    "add_chamber",
+    "add_provider",
+    "ask",
+    "get_status",
+    "get_metrics",
+    "export_prometheus",
+    "set_budget",
+    "mark_chamber_paid",
+    "mark_chamber_free",
+    "get_budget_status",
+    "default_revolver",
+    "DEFAULT_JUDGE_INSTRUCTION",
+    "DEFAULT_JSON_JUDGE_INSTRUCTION",
+    "DEFAULT_CORRUPTION_MARKERS",
+    "DEFAULT_RACE_MODE",
+    "DEFAULT_HEDGE_DELAY",
+    "MIN_HEDGE_DELAY",
+    "MAX_HEDGE_DELAY",
+    "DEFAULT_ASYNC_MAX_KEEPALIVE",
+    "DEFAULT_ASYNC_MAX_CONNECTIONS",
+    "KNOWN_PROVIDERS",
+    "TIER_SPRINT",
+    "TIER_HEAVY",
+    "TIER_ANY",
+    "detect_provider",
+    "discover_provider_models",
+    "classify_model_tier",
+    "ChamberStateStore",
+    "refresh_provider",
+    "prune_dead_models",
+    "replace_pruned_with_healthy",
+    "get_chamber_outage",
+    "MODELS_CACHE_PATH",
+    "CHAMBERS_STATE_PATH",
+    "DEFAULT_MODELS_CACHE_TTL",
+    "DEFAULT_MAX_DOWN_DAYS",
+    "DEFAULT_MIN_CONSECUTIVE_FAILURES",
+]
+
 # ---------------------------------------------------------------------------
 # Default Tuning Constants
 # ---------------------------------------------------------------------------
@@ -168,6 +213,8 @@ class BudgetGuard:
 
     def _save(self) -> None:
         try:
+            cfg_dir = os.path.dirname(os.path.abspath(self.config_path))
+            os.makedirs(cfg_dir, exist_ok=True)
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
         except OSError:
@@ -253,10 +300,16 @@ class BudgetGuard:
             return
 
         ignore_until = self.config.get("ignore_until")
-        if ignore_until and datetime.now() < datetime.fromisoformat(ignore_until):
-            self.config["ignore_until"] = None  # consume ignore-once after one pass
-            self._save()
-            return
+        if ignore_until:
+            try:
+                if datetime.now() < datetime.fromisoformat(ignore_until):
+                    return
+                else:
+                    self.config["ignore_until"] = None
+                    self._save()
+            except (ValueError, TypeError):
+                self.config["ignore_until"] = None
+                self._save()
 
         projected = self.config["spent_usd"] + estimated_cost_usd
         limit = self.config["limit_usd"]
@@ -1335,8 +1388,12 @@ class _BaseRevolver:
                     self._metrics["total_prompt_tokens"] += p_tok
                     self._metrics["total_completion_tokens"] += c_tok
 
-                    # Phase 5: cost accounting per chamber model.
+                    # Phase 5: cost accounting per chamber model or chamber budget rate.
                     rate = self.cost_rates.get(chamber["model"])
+                    if not rate and self._budget_guard is not None:
+                        b_ch = self._budget_guard.config.get("chambers", {}).get(name)
+                        if b_ch and b_ch.get("paid"):
+                            rate = (float(b_ch.get("rate_prompt", 0.0)), float(b_ch.get("rate_completion", 0.0)))
                     if rate:
                         prompt_rate, completion_rate = rate
                         call_cost = (p_tok / 1000.0) * prompt_rate + (c_tok / 1000.0) * completion_rate
@@ -1925,16 +1982,16 @@ class _BaseRevolver:
             warning_threshold_pct=warning_threshold_pct,
         )
 
-    def mark_chamber_paid(self, name: str, rate_prompt: float, rate_completion: float) -> None:
+    def mark_chamber_paid(self, name: str, rate_prompt: float, rate_completion: float, config_path: Optional[str] = None) -> None:
         """Tag a chamber as paid with per-1k-token rates (USD)."""
         if self._budget_guard is None:
-            self._budget_guard = BudgetGuard()
+            self._budget_guard = BudgetGuard(config_path=config_path or "revolver_budget.json")
         self._budget_guard.mark_paid(name, rate_prompt, rate_completion)
 
-    def mark_chamber_free(self, name: str) -> None:
+    def mark_chamber_free(self, name: str, config_path: Optional[str] = None) -> None:
         """Tag a chamber as free (no budget deduction)."""
         if self._budget_guard is None:
-            self._budget_guard = BudgetGuard()
+            self._budget_guard = BudgetGuard(config_path=config_path or "revolver_budget.json")
         self._budget_guard.mark_free(name)
 
     def get_budget_status(self) -> Dict[str, Any]:
@@ -2431,6 +2488,20 @@ class Revolver(_BaseRevolver):
         healthy, cooled = self.rank_chambers(time.time())
         classification = self.classify_prompt(user_message)
         racers = self._select_racers(healthy, cooled, classification)
+
+        # Budget guard: if paid racers are blocked, fall back to free-only chambers.
+        if racers and self._budget_guard is not None:
+            paid_racers = [c for c in racers if self._budget_guard.is_paid(c["name"])]
+            if paid_racers:
+                try:
+                    self._budget_check()
+                except BudgetExceeded:
+                    log.warning("Streaming budget exhausted; skipping paid chambers, falling back to free-only")
+                    racers = [c for c in racers if not self._budget_guard.is_paid(c["name"])]
+                    if not racers:
+                        yield BUSY_MESSAGE + " (budget exhausted, no free chambers available)"
+                        return
+
         racers_map = {c["name"]: c for c in racers}
 
         result_q: "queue.Queue[Tuple[str, ...]]" = queue.Queue()
@@ -2448,6 +2519,10 @@ class Revolver(_BaseRevolver):
                 resp = self._session.post(
                     chamber["url"], headers=headers, json=payload, stream=True, timeout=req_timeout
                 )
+                if getattr(resp, "status_code", 200) != 200:
+                    log.warning("Streaming chamber %s failed with HTTP %d", name, resp.status_code)
+                    result_q.put(("error", name, f"HTTP {resp.status_code}"))
+                    return
                 for raw_line in resp.iter_lines(decode_unicode=True):
                     if stop.is_set():
                         break
@@ -2528,6 +2603,9 @@ class Revolver(_BaseRevolver):
             for chamber in racers:
                 if chamber["name"] != winner:
                     self._apply_outcome(chamber, ("network", None))
+
+        if not yielded_any:
+            yield BUSY_MESSAGE
 
     def close(self) -> None:
         """Close thread pool executor and HTTP session."""
@@ -3091,6 +3169,20 @@ class AsyncRevolver(_BaseRevolver):
         healthy, cooled = self.rank_chambers(time.time())
         classification = self.classify_prompt(user_message)
         racers = self._select_racers(healthy, cooled, classification)
+
+        # Budget guard: if paid racers are blocked, fall back to free-only chambers.
+        if racers and self._budget_guard is not None:
+            paid_racers = [c for c in racers if self._budget_guard.is_paid(c["name"])]
+            if paid_racers:
+                try:
+                    self._budget_check()
+                except BudgetExceeded:
+                    log.warning("Streaming budget exhausted; skipping paid chambers, falling back to free-only")
+                    racers = [c for c in racers if not self._budget_guard.is_paid(c["name"])]
+                    if not racers:
+                        yield BUSY_MESSAGE + " (budget exhausted, no free chambers available)"
+                        return
+
         racers_map = {c["name"]: c for c in racers}
 
         result_q: "asyncio.Queue[Tuple[str, ...]]" = asyncio.Queue()
@@ -3109,6 +3201,10 @@ class AsyncRevolver(_BaseRevolver):
                 async with client.stream(
                     "POST", chamber["url"], headers=headers, json=payload, timeout=req_timeout
                 ) as resp:
+                    if getattr(resp, "status_code", 200) != 200:
+                        log.warning("Async streaming chamber %s failed with HTTP %d", name, resp.status_code)
+                        await result_q.put(("error", name, f"HTTP {resp.status_code}"))
+                        return
                     async for raw_line in resp.aiter_lines():
                         if stop.is_set():
                             break
@@ -3185,6 +3281,9 @@ class AsyncRevolver(_BaseRevolver):
                 if chamber["name"] != winner:
                     self._apply_outcome(chamber, ("network", None))
 
+        if not yielded_any:
+            yield BUSY_MESSAGE
+
     async def aclose(self) -> None:
         """Asynchronously close the pooled `httpx.AsyncClient`."""
         if self._client is not None:
@@ -3237,12 +3336,12 @@ def set_budget(limit_usd: float, cycle_type: str = "monthly", custom_days: int =
     return default_revolver.set_budget(limit_usd, cycle_type, custom_days, warning_threshold_pct, config_path)
 
 
-def mark_chamber_paid(name: str, rate_prompt: float, rate_completion: float) -> None:
-    return default_revolver.mark_chamber_paid(name, rate_prompt, rate_completion)
+def mark_chamber_paid(name: str, rate_prompt: float, rate_completion: float, config_path: Optional[str] = None) -> None:
+    return default_revolver.mark_chamber_paid(name, rate_prompt, rate_completion, config_path=config_path)
 
 
-def mark_chamber_free(name: str) -> None:
-    return default_revolver.mark_chamber_free(name)
+def mark_chamber_free(name: str, config_path: Optional[str] = None) -> None:
+    return default_revolver.mark_chamber_free(name, config_path=config_path)
 
 
 def get_budget_status() -> Dict[str, Any]:
@@ -3265,3 +3364,10 @@ def replace_pruned_with_healthy(*args, **kwargs):
 
 def get_chamber_outage(name: str) -> Dict[str, Any]:
     return default_revolver.get_chamber_outage(name)
+
+
+if __name__ == "__main__":
+    import sys
+    import revolver_cli
+
+    sys.exit(revolver_cli.main())
